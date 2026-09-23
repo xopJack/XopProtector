@@ -89,6 +89,9 @@ unimp-host/src/main/assets/apps/
 unimp-host/src/main/assets/*.wgt
 unimp-host/libs/
 
+# Machine-local SDK path (ANDROID_HOME / default SDK location used when absent)
+local.properties
+
 # uni-app CLI build artifacts
 uniapp-demo/node_modules/
 uniapp-demo/dist/

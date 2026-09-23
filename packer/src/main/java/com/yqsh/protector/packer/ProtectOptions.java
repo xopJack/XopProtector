@@ -49,6 +49,11 @@ public final class ProtectOptions {
      * {@code --protect-so-exclude libd3.so,libzhd3d.so}.
      */
     public java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
+    /**
+     * If non-empty, ONLY these basenames are encrypted (mutually exclusive with
+     * {@link #protectSoExclude}; include wins). CLI: {@code --protect-so-include libx.so,liby.so}.
+     */
+    public java.util.LinkedHashSet<String> protectSoInclude = new java.util.LinkedHashSet<>();
 
     /**
      * Runtime SO decrypt timing (written to {@code config.json}).

@@ -209,6 +209,12 @@ public final class BusinessSoProtector {
          * Matched after normalizing to {@code lib*.so}. Reason in report: {@code exclude}.
          */
         public java.util.Set<String> excludeBasenames = new java.util.LinkedHashSet<>();
+        /**
+         * If non-empty, ONLY these basenames are candidates for encryption;
+         * everything else is skipped with report reason {@code not_included}.
+         * Mutually exclusive with {@code excludeBasenames} — one filter, not both.
+         */
+        public java.util.Set<String> includeBasenames = new java.util.LinkedHashSet<>();
     }
 
     /** Normalize user input to {@code libfoo.so} (accepts {@code foo}, {@code libfoo}, {@code libfoo.so}). */
@@ -227,6 +233,17 @@ public final class BusinessSoProtector {
         if (excludes == null || excludes.isEmpty() || name == null) return false;
         String n = normalizeSoBasename(name);
         for (String e : excludes) {
+            if (n.equals(normalizeSoBasename(e))) return true;
+        }
+        return false;
+    }
+
+    /** {@code true} when {@code includes} is empty (no filter) or {@code name} is in it. */
+    private static boolean isIncludedBasename(String name, java.util.Set<String> includes) {
+        if (includes == null || includes.isEmpty()) return true;
+        if (name == null) return false;
+        String n = normalizeSoBasename(name);
+        for (String e : includes) {
             if (n.equals(normalizeSoBasename(e))) return true;
         }
         return false;
@@ -502,6 +519,14 @@ public final class BusinessSoProtector {
         ProtectResult result = new ProtectResult(new ArrayList<>());
         if (unpackLibRoot == null || !unpackLibRoot.isDirectory()) return result;
 
+        boolean hasInclude = opts.includeBasenames != null && !opts.includeBasenames.isEmpty();
+        boolean hasExclude = opts.excludeBasenames != null && !opts.excludeBasenames.isEmpty();
+        if (hasInclude && hasExclude) {
+            throw new IllegalArgumentException(
+                    "--protect-so-include and --protect-so-exclude are mutually exclusive: "
+                            + "pass one filter, not both");
+        }
+
         File[] abis = unpackLibRoot.listFiles(File::isDirectory);
         if (abis == null) return result;
 
@@ -531,6 +556,13 @@ public final class BusinessSoProtector {
                     result.skippedPolicy.add(new SoDecision(
                             abiName, name, so.length(), 0, 0, "exclude"));
                     System.out.println("SKIP business SO (exclude): "
+                            + abiName + "/" + name);
+                    continue;
+                }
+                if (!isIncludedBasename(name, opts.includeBasenames)) {
+                    result.skippedPolicy.add(new SoDecision(
+                            abiName, name, so.length(), 0, 0, "not_included"));
+                    System.out.println("SKIP business SO (not_included): "
                             + abiName + "/" + name);
                     continue;
                 }

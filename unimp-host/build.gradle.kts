@@ -5,19 +5,22 @@ plugins {
 
 /**
  * UniMP Android SDK 5.14 libs directory.
- * Override in gradle.properties: unimp.sdk.libs=E\:\\Android\\SDK-Android@5.14-20260706\\SDK\\libs
+ * Resolved from, in order: unimp.sdk.libs in gradle.properties,
+ * $UNIMP_SDK_LIBS, then the sibling ../SDK-Android@5.14-20260706/SDK/libs.
+ * Never a hard-coded machine path, so this builds on any OS.
  */
 val unimpSdkLibs: File = run {
     val fromProp = (project.findProperty("unimp.sdk.libs") as String?)?.trim().orEmpty()
+    val fromEnv = System.getenv("UNIMP_SDK_LIBS")?.trim().orEmpty()
     val candidates = listOfNotNull(
         fromProp.takeIf { it.isNotEmpty() }?.let { file(it) },
-        file("E:/Android/SDK-Android@5.14-20260706/SDK/libs"),
+        fromEnv.takeIf { it.isNotEmpty() }?.let { file(it) },
         rootProject.file("../SDK-Android@5.14-20260706/SDK/libs"),
     )
     candidates.firstOrNull { it.isDirectory }
         ?: error(
             "UniMP SDK libs not found. Set unimp.sdk.libs in gradle.properties " +
-                "to .../SDK-Android@5.14-20260706/SDK/libs"
+                "or UNIMP_SDK_LIBS to .../SDK-Android@5.14-20260706/SDK/libs"
         )
 }
 

@@ -20,9 +20,10 @@ include(":packer")
 
 // UniMP host needs local SDK AARs; skip when missing so packer/native/desktop still build.
 val unimpLibsProp = providers.gradleProperty("unimp.sdk.libs").orNull?.trim().orEmpty()
+val unimpLibsEnv = System.getenv("UNIMP_SDK_LIBS")?.trim().orEmpty()
 val unimpLibsCandidates = listOfNotNull(
     unimpLibsProp.takeIf { it.isNotEmpty() }?.let { file(it) },
-    file("E:/Android/SDK-Android@5.14-20260706/SDK/libs"),
+    unimpLibsEnv.takeIf { it.isNotEmpty() }?.let { file(it) },
     file("../SDK-Android@5.14-20260706/SDK/libs"),
 )
 if (unimpLibsCandidates.any { it.isDirectory }) {

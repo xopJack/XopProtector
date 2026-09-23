@@ -213,10 +213,16 @@ tasks.register("syncUnimpSampleAssets") {
     description = "Copy DCloud SDK DEMO sample app (__UNI__F743940) into unimp-host assets"
     doLast {
         val sdkRootProp = (project.findProperty("unimp.sdk.libs") as String?)?.trim().orEmpty()
-        val libsDir = when {
-            sdkRootProp.isNotEmpty() -> file(sdkRootProp)
-            else -> file("E:/Android/SDK-Android@5.14-20260706/SDK/libs")
-        }
+        val sdkRootEnv = System.getenv("UNIMP_SDK_LIBS")?.trim().orEmpty()
+        val libsDir = listOfNotNull(
+            sdkRootProp.takeIf { it.isNotEmpty() }?.let { file(it) },
+            sdkRootEnv.takeIf { it.isNotEmpty() }?.let { file(it) },
+            rootProject.file("../SDK-Android@5.14-20260706/SDK/libs"),
+        ).firstOrNull { it.isDirectory }
+            ?: throw GradleException(
+                "UniMP SDK libs not found. Set unimp.sdk.libs, \$UNIMP_SDK_LIBS, " +
+                    "or place the SDK at ../SDK-Android@5.14-20260706."
+            )
         val demoApps = libsDir.parentFile?.parentFile
             ?.resolve("DEMO/UniMPDemo/app/src/main/assets/apps/__UNI__F743940")
             ?: throw GradleException("Cannot resolve SDK DEMO apps from ${libsDir.absolutePath}")

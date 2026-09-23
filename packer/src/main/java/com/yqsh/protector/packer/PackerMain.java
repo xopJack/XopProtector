@@ -112,6 +112,8 @@ public class PackerMain {
     private String protectSoAbi = "all";
     /** Exact SO basenames to skip (see {@code --protect-so-exclude}). */
     private final java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
+    /** If non-empty, only these SO basenames are encrypted (see {@code --protect-so-include}). */
+    private final java.util.LinkedHashSet<String> protectSoInclude = new java.util.LinkedHashSet<>();
     /** Runtime SO decrypt timing — default eager (full materialize + preload). */
     private ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
     /** Per-APK PVM2 opcode morph (Phase 3); set in protect(). */
@@ -168,6 +170,13 @@ public class PackerMain {
             for (String e : options.protectSoExclude) {
                 String n = BusinessSoProtector.normalizeSoBasename(e);
                 if (!n.isEmpty()) protectSoExclude.add(n);
+            }
+        }
+        protectSoInclude.clear();
+        if (options.protectSoInclude != null) {
+            for (String e : options.protectSoInclude) {
+                String n = BusinessSoProtector.normalizeSoBasename(e);
+                if (!n.isEmpty()) protectSoInclude.add(n);
             }
         }
         soDecryptMode = options.soDecryptMode != null
@@ -321,6 +330,7 @@ public class PackerMain {
                 + "[--protect-so-budget-mb <n>] [--protect-so-max-file-mb <n>] "
                 + "[--protect-so-abi <abi>|all] "
                 + "[--protect-so-exclude <liba.so,libb.so>] "
+                + "[--protect-so-include <libx.so>] "
                 + "[--so-decrypt-mode eager|lazy] "
                 + "[--application <real.Application>] "
                 + "[--cert-sha256 <hex>] "
@@ -364,6 +374,8 @@ public class PackerMain {
         System.err.println("  --protect-so-abi   all (default) | arm64-v8a | …");
         System.err.println("  --protect-so-exclude  comma-separated basenames to never encrypt");
         System.err.println("                     (e.g. libd3.so,libzhd3d.so); repeatable");
+        System.err.println("  --protect-so-include comma-separated basenames to encrypt ONLY");
+        System.err.println("                     (mutually exclusive with --protect-so-exclude)");
         System.err.println("  --so-decrypt-mode  eager (default)=full materialize+preload at cold start;");
         System.err.println("                     lazy=on-demand + background fill (this process only)");
         System.err.println("                     Prefer loadLibrary after Application attach.");
@@ -402,6 +414,7 @@ public class PackerMain {
         boolean protectSoMaxFileExplicit = false;
         String protectSoAbi = "all";
         java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
+        java.util.LinkedHashSet<String> protectSoInclude = new java.util.LinkedHashSet<>();
         ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
         ProtectPolicy.Profile profile = ProtectPolicy.Profile.BALANCED;
         List<String> hollowPrefixes = new ArrayList<>();
@@ -471,6 +484,11 @@ public class PackerMain {
                 for (String part : args[++i].split(",")) {
                     String n = BusinessSoProtector.normalizeSoBasename(part);
                     if (!n.isEmpty()) protectSoExclude.add(n);
+                }
+            } else if ("--protect-so-include".equals(args[i]) && i + 1 < args.length) {
+                for (String part : args[++i].split(",")) {
+                    String n = BusinessSoProtector.normalizeSoBasename(part);
+                    if (!n.isEmpty()) protectSoInclude.add(n);
                 }
             } else if ("--so-decrypt-mode".equals(args[i]) && i + 1 < args.length) {
                 soDecryptMode = ProtectOptions.parseSoDecryptMode(args[++i]);
@@ -555,6 +573,8 @@ public class PackerMain {
         options.protectSoAbi = protectSoAbi;
         options.protectSoExclude.clear();
         options.protectSoExclude.addAll(protectSoExclude);
+        options.protectSoInclude.clear();
+        options.protectSoInclude.addAll(protectSoInclude);
         options.soDecryptMode = soDecryptMode;
         options.applicationOverride = applicationOverride;
         options.certSha256Override = certSha256Override;
@@ -745,6 +765,7 @@ public class PackerMain {
                 soOpts.maxFileMb = protectSoMaxFileMb;
                 soOpts.abiFilter = protectSoAbi;
                 soOpts.excludeBasenames = new java.util.LinkedHashSet<>(protectSoExclude);
+                soOpts.includeBasenames = new java.util.LinkedHashSet<>(protectSoInclude);
                 soOpts.compressedSizes = soCompressedSizes;
                 soOpts.storedEntries = storeEntries;
                 soResult = BusinessSoProtector.protectAll(new File(unpack, "lib"), soOpts);
