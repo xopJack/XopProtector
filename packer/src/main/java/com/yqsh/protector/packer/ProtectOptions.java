@@ -86,6 +86,13 @@ public final class ProtectOptions {
     public static String soDecryptModeWire(SoDecryptMode mode) {
         return mode == SoDecryptMode.LAZY ? "lazy" : "eager";
     }
+
+    /**
+     * Embed {@code so_diag:true} in config.json so Release native emits [XOP-SO] logs.
+     * Also toggleable at runtime via {@code adb shell setprop debug.protector.so_diag 1}.
+     */
+    public boolean soDiag = false;
+
     /**
      * When true, {@link ProtectPolicy.Profile#INDUSTRY} will not replace
      * {@link #protectSoBudgetMb} with the industry default (48).

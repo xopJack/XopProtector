@@ -66,9 +66,9 @@ static void native_ensure_business_so(JNIEnv* env, jclass, jstring name) {
 }
 
 static void native_finish_business_so(JNIEnv*, jclass) {
-    // Linker DT_NEEDED bypasses hooked dlopen — preload so_plain deps.
-    // Eager: all keyed. Lazy: only already-materialized mirrors (Phase 2).
-    // Idempotent: ACF + Application bootstrap both call this.
+    // Attach does not pin the keyed set. Linker openat rewrite + on-demand
+    // closure keep DT_NEEDED off extract ciphertext. Fallback full pin only
+    // when hooks are missing. Idempotent.
     protector::so::preload_so_plain();
     protector::so::decrypt_already_loaded_async();
 }

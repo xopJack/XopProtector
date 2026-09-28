@@ -9,6 +9,7 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -241,13 +242,49 @@ public final class BusinessSoProtector {
         public final List<SoDecision> skippedReloc = new ArrayList<>();
         public long estimatedDeltaBytes;
         public boolean budgetTruncated;
+        /** Mode used for this protect run (for so_text_diag / size_report). */
+        public Mode mode;
 
         public ProtectResult(List<Entry> entries) {
             this.entries = entries != null ? entries : new ArrayList<>();
         }
     }
 
-    /** One SO file decision for size_report. */
+    /**
+     * Portable .text / covering PT_LOAD metadata for pack↔runtime integrity checks.
+     * {@code textSha256} is plaintext .text (before RC4); null when not hashed.
+     */
+    public static final class TextDiag {
+        public final long textOffset;
+        public final long textSize;
+        public final long textShAddr;
+        public final String textSha256;
+        /** Covering PT_LOAD; {@code ptFlags < 0} means unknown / not found. */
+        public final long ptOffset;
+        public final long ptVaddr;
+        public final long ptFilesz;
+        public final long ptMemsz;
+        public final int ptFlags;
+
+        public TextDiag(long textOffset, long textSize, long textShAddr, String textSha256,
+                        long ptOffset, long ptVaddr, long ptFilesz, long ptMemsz, int ptFlags) {
+            this.textOffset = textOffset;
+            this.textSize = textSize;
+            this.textShAddr = textShAddr;
+            this.textSha256 = textSha256;
+            this.ptOffset = ptOffset;
+            this.ptVaddr = ptVaddr;
+            this.ptFilesz = ptFilesz;
+            this.ptMemsz = ptMemsz;
+            this.ptFlags = ptFlags;
+        }
+
+        public boolean hasPtLoad() {
+            return ptFlags >= 0;
+        }
+    }
+
+    /** One SO file decision for size_report / so_text_diag. */
     public static final class SoDecision {
         public final String abi;
         public final String name;
@@ -255,15 +292,35 @@ public final class BusinessSoProtector {
         public final long textBytes;
         public final long estimatedDeltaBytes;
         public final String reason;
+        /** Non-null for ENCRYPT when .text meta was captured. */
+        public final TextDiag textDiag;
+        /**
+         * Runtime L2e (extract inode + in-memory decrypt). True only when
+         * {@link #isPathSensitive} matched — never size-only.
+         */
+        public final boolean l2e;
 
         public SoDecision(String abi, String name, long fileBytes, long textBytes,
                           long estimatedDeltaBytes, String reason) {
+            this(abi, name, fileBytes, textBytes, estimatedDeltaBytes, reason, null, false);
+        }
+
+        public SoDecision(String abi, String name, long fileBytes, long textBytes,
+                          long estimatedDeltaBytes, String reason, TextDiag textDiag) {
+            this(abi, name, fileBytes, textBytes, estimatedDeltaBytes, reason, textDiag, false);
+        }
+
+        public SoDecision(String abi, String name, long fileBytes, long textBytes,
+                          long estimatedDeltaBytes, String reason, TextDiag textDiag,
+                          boolean l2e) {
             this.abi = abi;
             this.name = name;
             this.fileBytes = fileBytes;
             this.textBytes = textBytes;
             this.estimatedDeltaBytes = estimatedDeltaBytes;
             this.reason = reason;
+            this.textDiag = textDiag;
+            this.l2e = l2e;
         }
 
         public String path() {
@@ -500,6 +557,7 @@ public final class BusinessSoProtector {
         Options opts = options != null ? options : new Options();
         Mode m = opts.mode != null ? opts.mode : Mode.SAFE;
         ProtectResult result = new ProtectResult(new ArrayList<>());
+        result.mode = m;
         if (unpackLibRoot == null || !unpackLibRoot.isDirectory()) return result;
 
         File[] abis = unpackLibRoot.listFiles(File::isDirectory);
@@ -528,15 +586,19 @@ public final class BusinessSoProtector {
             for (File so : sos) {
                 String name = so.getName();
                 if (isExcludedBasename(name, opts.excludeBasenames)) {
-                    result.skippedPolicy.add(new SoDecision(
-                            abiName, name, so.length(), 0, 0, "exclude"));
+                    SoDecision d = new SoDecision(
+                            abiName, name, so.length(), 0, 0, "exclude");
+                    result.skippedPolicy.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (exclude): "
                             + abiName + "/" + name);
                     continue;
                 }
                 String reason = skipReason(name, m);
                 if (reason != null) {
-                    result.skippedPolicy.add(new SoDecision(abiName, name, so.length(), 0, 0, reason));
+                    SoDecision d = new SoDecision(abiName, name, so.length(), 0, 0, reason);
+                    result.skippedPolicy.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (" + reason + "): "
                             + abiName + "/" + name);
                     continue;
@@ -545,16 +607,20 @@ public final class BusinessSoProtector {
                 // encrypt them under AGGRESSIVE). See docs/so-load-contract.md.
                 if (m != Mode.AGGRESSIVE && isPathSensitive(so)) {
                     basenameAbiBlock.putIfAbsent(name, "path_sensitive");
-                    result.skippedPolicy.add(new SoDecision(
-                            abiName, name, so.length(), 0, 0, "path_sensitive"));
+                    SoDecision d = new SoDecision(
+                            abiName, name, so.length(), 0, 0, "path_sensitive");
+                    result.skippedPolicy.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (path_sensitive): "
                             + abiName + "/" + name);
                     continue;
                 }
                 if (hasUnsafeTextRelocs(so)) {
                     basenameAbiBlock.putIfAbsent(name, "relocs patch .text");
-                    result.skippedReloc.add(new SoDecision(
-                            abiName, name, so.length(), 0, 0, "relocs patch .text"));
+                    SoDecision d = new SoDecision(
+                            abiName, name, so.length(), 0, 0, "relocs patch .text");
+                    result.skippedReloc.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (relocs patch .text): "
                             + abiName + "/" + name);
                     continue;
@@ -562,8 +628,10 @@ public final class BusinessSoProtector {
                 long textSize = readTextSize(so);
                 if (textSize <= 0) {
                     basenameAbiBlock.putIfAbsent(name, "no .text");
-                    result.skippedPolicy.add(new SoDecision(
-                            abiName, name, so.length(), 0, 0, "no .text"));
+                    SoDecision d = new SoDecision(
+                            abiName, name, so.length(), 0, 0, "no .text");
+                    result.skippedPolicy.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (no .text): "
                             + abiName + "/" + name);
                     continue;
@@ -593,13 +661,17 @@ public final class BusinessSoProtector {
                 if (siblings == null || siblings.isEmpty()) continue;
                 String siblingReason = blockReason + "_abi";
                 for (Candidate c : siblings) {
+                    SoDecision d;
                     if ("relocs patch .text".equals(blockReason)) {
-                        result.skippedReloc.add(new SoDecision(
-                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason));
+                        d = new SoDecision(
+                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason);
+                        result.skippedReloc.add(d);
                     } else {
-                        result.skippedPolicy.add(new SoDecision(
-                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason));
+                        d = new SoDecision(
+                                c.abi, c.name, c.fileBytes, c.textBytes, 0, siblingReason);
+                        result.skippedPolicy.add(d);
                     }
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (" + siblingReason + "): "
                             + c.path() + " (basename blocked on another ABI)");
                 }
@@ -646,6 +718,7 @@ public final class BusinessSoProtector {
                             c.estimatedDeltaBytes,
                             String.format(Locale.US, "size-budget max-file>%.1fMB", opts.maxFileMb));
                     result.skippedBudget.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (size-budget): " + c.path()
                             + " file_mb=" + String.format(Locale.US, "%.2f", c.fileBytes / (1024.0 * 1024.0))
                             + " est_delta_mb=" + String.format(Locale.US, "%.2f",
@@ -660,6 +733,7 @@ public final class BusinessSoProtector {
                             c.estimatedDeltaBytes,
                             String.format(Locale.US, "size-budget total>%.1fMB", opts.budgetMb));
                     result.skippedBudget.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (size-budget): " + c.path()
                             + " est_delta_mb=" + String.format(Locale.US, "%.2f",
                             c.estimatedDeltaBytes / (1024.0 * 1024.0)));
@@ -676,6 +750,7 @@ public final class BusinessSoProtector {
                             c.estimatedDeltaBytes,
                             String.format(Locale.US, "size-budget alone>%.1fMB", opts.budgetMb));
                     result.skippedBudget.add(d);
+                    logXopPackSkip(m, d);
                     System.out.println("SKIP business SO (size-budget): " + c.path()
                             + " est_delta_mb=" + String.format(Locale.US, "%.2f",
                             c.estimatedDeltaBytes / (1024.0 * 1024.0)));
@@ -709,11 +784,14 @@ public final class BusinessSoProtector {
                 entries.add(new Entry(g.name, key));
             }
             for (Candidate c : g.files) {
-                encryptText(c.so, key);
+                // Markers live in .dynstr/.rodata — capture before in-place .text RC4.
+                boolean l2e = isPathSensitive(c.so);
+                TextDiag diag = encryptText(c.so, key);
                 SoDecision d = new SoDecision(c.abi, c.name, c.fileBytes, c.textBytes,
-                        c.estimatedDeltaBytes, "encrypted");
+                        c.estimatedDeltaBytes, "encrypted", diag, l2e);
                 result.encrypted.add(d);
                 result.estimatedDeltaBytes += c.estimatedDeltaBytes;
+                logXopPackEncrypt(m, d);
                 System.out.println("Protected business SO .text: " + c.path()
                         + " est_delta_mb=" + String.format(Locale.US, "%.2f",
                         c.estimatedDeltaBytes / (1024.0 * 1024.0)));
@@ -971,6 +1049,10 @@ public final class BusinessSoProtector {
         sb.append(String.format(Locale.US, "  \"delta_pct\": %.2f,\n", deltaPct));
         sb.append("  \"protect_so\": ").append(protectSoEnabled).append(",\n");
         if (so != null) {
+            if (so.mode != null) {
+                sb.append("  \"so_mode\": \"").append(so.mode.name().toLowerCase(Locale.ROOT))
+                        .append("\",\n");
+            }
             sb.append(String.format(Locale.US,
                     "  \"est_so_delta_mb\": %.3f,\n", so.estimatedDeltaBytes / (1024.0 * 1024.0)));
             sb.append("  \"budget_truncated\": ").append(so.budgetTruncated).append(",\n");
@@ -989,6 +1071,69 @@ public final class BusinessSoProtector {
             sb.append("  \"top_delta_contributors\": []\n");
         }
         sb.append("}\n");
+        return sb.toString();
+    }
+
+    /**
+     * Portable plaintext-.text digests for runtime A/B (assets/protector/so_text_diag.json).
+     * Does not change sokeys; diagnostic only.
+     */
+    public static String buildSoTextDiagJson(ProtectResult so) {
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append("{\n");
+        sb.append("  \"version\": 2,\n");
+        if (so != null && so.mode != null) {
+            sb.append("  \"mode\": \"").append(so.mode.name().toLowerCase(Locale.ROOT))
+                    .append("\",\n");
+        } else {
+            sb.append("  \"mode\": \"\",\n");
+        }
+        sb.append("  \"entries\": [");
+        List<SoDecision> list = so != null ? so.encrypted : null;
+        if (list == null || list.isEmpty()) {
+            sb.append("]\n}\n");
+            return sb.toString();
+        }
+        sb.append("\n");
+        for (int i = 0; i < list.size(); i++) {
+            SoDecision d = list.get(i);
+            TextDiag t = d.textDiag;
+            sb.append("    {\n");
+            sb.append("      \"path\": \"").append(escapeJson(d.path())).append("\",\n");
+            sb.append("      \"abi\": \"").append(escapeJson(d.abi)).append("\",\n");
+            sb.append("      \"name\": \"").append(escapeJson(d.name)).append("\",\n");
+            sb.append("      \"file_size\": ").append(d.fileBytes).append(",\n");
+            if (t != null) {
+                sb.append("      \"text_offset\": ").append(t.textOffset).append(",\n");
+                sb.append("      \"text_size\": ").append(t.textSize).append(",\n");
+                sb.append("      \"text_sh_addr\": ").append(t.textShAddr).append(",\n");
+                sb.append("      \"text_sha256\": \"")
+                        .append(escapeJson(t.textSha256 != null ? t.textSha256 : ""))
+                        .append("\",\n");
+                if (t.hasPtLoad()) {
+                    sb.append("      \"pt_load\": {\n");
+                    sb.append("        \"p_offset\": ").append(t.ptOffset).append(",\n");
+                    sb.append("        \"p_vaddr\": ").append(t.ptVaddr).append(",\n");
+                    sb.append("        \"p_filesz\": ").append(t.ptFilesz).append(",\n");
+                    sb.append("        \"p_memsz\": ").append(t.ptMemsz).append(",\n");
+                    sb.append("        \"p_flags\": ").append(t.ptFlags).append("\n");
+                    sb.append("      },\n");
+                } else {
+                    sb.append("      \"pt_load\": null,\n");
+                }
+            } else {
+                sb.append("      \"text_offset\": 0,\n");
+                sb.append("      \"text_size\": ").append(d.textBytes).append(",\n");
+                sb.append("      \"text_sh_addr\": 0,\n");
+                sb.append("      \"text_sha256\": \"\",\n");
+                sb.append("      \"pt_load\": null,\n");
+            }
+            sb.append("      \"l2e\": ").append(d.l2e ? "true" : "false").append("\n");
+            sb.append("    }");
+            if (i + 1 < list.size()) sb.append(",");
+            sb.append("\n");
+        }
+        sb.append("  ]\n}\n");
         return sb.toString();
     }
 
@@ -1015,12 +1160,23 @@ public final class BusinessSoProtector {
         sb.append("\n");
         for (int i = 0; i < list.size(); i++) {
             SoDecision d = list.get(i);
+            sb.append("    {\"path\": \"").append(escapeJson(d.path())).append("\"");
             sb.append(String.format(Locale.US,
-                    "    {\"path\": \"%s\", \"file_mb\": %.3f, \"est_delta_mb\": %.3f, \"reason\": \"%s\"}",
-                    escapeJson(d.path()),
+                    ", \"file_mb\": %.3f, \"est_delta_mb\": %.3f, \"reason\": \"%s\"",
                     d.fileBytes / (1024.0 * 1024.0),
                     d.estimatedDeltaBytes / (1024.0 * 1024.0),
                     escapeJson(d.reason != null ? d.reason : "")));
+            TextDiag t = d.textDiag;
+            if (t != null) {
+                sb.append(", \"text_offset\": ").append(t.textOffset);
+                sb.append(", \"text_size\": ").append(t.textSize);
+                sb.append(", \"text_sh_addr\": ").append(t.textShAddr);
+                if (t.textSha256 != null && !t.textSha256.isEmpty()) {
+                    sb.append(", \"text_sha256\": \"").append(escapeJson(t.textSha256))
+                            .append("\"");
+                }
+            }
+            sb.append("}");
             if (i + 1 < list.size()) sb.append(",");
             sb.append("\n");
         }
@@ -1034,7 +1190,54 @@ public final class BusinessSoProtector {
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
-    private static void encryptText(File soFile, byte[] key) throws Exception {
+    private static void logXopPackSkip(Mode mode, SoDecision d) {
+        System.out.println(String.format(Locale.US,
+                "[XOP-PACK] name=%s abi=%s decision=SKIP mode=%s reason=%s file_size=%d text_bytes=%d",
+                d.name,
+                d.abi,
+                mode.name().toLowerCase(Locale.ROOT),
+                d.reason != null ? d.reason : "",
+                d.fileBytes,
+                d.textBytes));
+    }
+
+    private static void logXopPackEncrypt(Mode mode, SoDecision d) {
+        TextDiag t = d.textDiag;
+        if (t == null) {
+            System.out.println(String.format(Locale.US,
+                    "[XOP-PACK] name=%s abi=%s decision=ENCRYPT mode=%s reason=encrypted file_size=%d",
+                    d.name, d.abi, mode.name().toLowerCase(Locale.ROOT), d.fileBytes));
+            return;
+        }
+        StringBuilder sb = new StringBuilder(256);
+        sb.append(String.format(Locale.US,
+                "[XOP-PACK] name=%s abi=%s decision=ENCRYPT mode=%s reason=encrypted"
+                        + " l2e=%s file_size=%d text_offset=0x%x text_size=0x%x text_sh_addr=0x%x"
+                        + " text_sha256=%s",
+                d.name,
+                d.abi,
+                mode.name().toLowerCase(Locale.ROOT),
+                d.l2e ? "true" : "false",
+                d.fileBytes,
+                t.textOffset,
+                t.textSize,
+                t.textShAddr,
+                t.textSha256 != null ? t.textSha256 : ""));
+        if (t.hasPtLoad()) {
+            sb.append(String.format(Locale.US,
+                    " pt_load=p_offset=0x%x/p_vaddr=0x%x/p_filesz=0x%x/p_memsz=0x%x/p_flags=0x%x",
+                    t.ptOffset, t.ptVaddr, t.ptFilesz, t.ptMemsz, t.ptFlags));
+        } else {
+            sb.append(" pt_load=none");
+        }
+        System.out.println(sb);
+    }
+
+    /**
+     * RC4-encrypt {@code .text} in place. Returns plaintext .text SHA-256 + ELF meta
+     * captured before encryption.
+     */
+    private static TextDiag encryptText(File soFile, byte[] key) throws Exception {
         try (ReadElf elf = new ReadElf(soFile)) {
             for (ReadElf.SectionHeader sh : elf.getSectionHeaders()) {
                 if (!".text".equals(sh.getName())) continue;
@@ -1042,14 +1245,112 @@ public final class BusinessSoProtector {
                 int size = (int) sh.getSize();
                 if (size <= 0) throw new IllegalStateException("empty .text in " + soFile.getName());
                 byte[] plain = readAt(soFile, offset, size);
+                String sha256 = sha256Hex(plain);
+                long[] pt = findCoveringPtLoad(soFile, offset, size);
                 byte[] enc = CryptoUtils.rc4Crypt(key, plain);
                 writeAt(soFile, offset, enc);
                 System.out.println(String.format(Locale.US,
-                        "  RC4 .text offset=0x%x size=%d", offset, size));
-                return;
+                        "  RC4 .text offset=0x%x size=%d sha256=%s", offset, size, sha256));
+                return new TextDiag(
+                        offset, size, sh.getAddr(), sha256,
+                        pt[0], pt[1], pt[2], pt[3], (int) pt[4]);
             }
         }
         throw new IllegalStateException("no .text in " + soFile.getName());
+    }
+
+    private static String sha256Hex(byte[] data) throws Exception {
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        return CryptoUtils.toHex(md.digest(data));
+    }
+
+    /**
+     * Find PT_LOAD covering {@code [.text file range)}. Prefers PF_X.
+     * Returns {@code [p_offset, p_vaddr, p_filesz, p_memsz, p_flags]} or
+     * zeros with flags={@code -1} if not found.
+     */
+    static long[] findCoveringPtLoad(File soFile, long textOffset, long textSize) {
+        long[] none = new long[]{0, 0, 0, 0, -1};
+        if (soFile == null || textSize <= 0) return none;
+        long textEnd = textOffset + textSize;
+        try (RandomAccessFile raf = new RandomAccessFile(soFile, "r")) {
+            byte[] ident = new byte[16];
+            raf.readFully(ident);
+            if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') {
+                return none;
+            }
+            boolean is64 = ident[4] == 2;
+            boolean le = ident[5] == 1;
+            ByteOrder order = le ? ByteOrder.LITTLE_ENDIAN : ByteOrder.BIG_ENDIAN;
+            raf.seek(0);
+            byte[] ehdr = new byte[is64 ? 64 : 52];
+            raf.readFully(ehdr);
+            ByteBuffer eb = ByteBuffer.wrap(ehdr).order(order);
+            long phOff;
+            int phEntSize;
+            int phNum;
+            if (is64) {
+                eb.position(32);
+                phOff = eb.getLong();
+                eb.position(54);
+                phEntSize = eb.getShort() & 0xffff;
+                phNum = eb.getShort() & 0xffff;
+            } else {
+                eb.position(28);
+                phOff = eb.getInt() & 0xffffffffL;
+                eb.position(42);
+                phEntSize = eb.getShort() & 0xffff;
+                phNum = eb.getShort() & 0xffff;
+            }
+            if (phOff == 0 || phNum == 0 || phEntSize < (is64 ? 56 : 32)) return none;
+
+            final int PT_LOAD = 1;
+            final int PF_X = 1;
+            long[] best = null;
+            boolean bestExec = false;
+            for (int i = 0; i < phNum; i++) {
+                raf.seek(phOff + (long) i * phEntSize);
+                byte[] ph = new byte[phEntSize];
+                raf.readFully(ph);
+                ByteBuffer pb = ByteBuffer.wrap(ph).order(order);
+                long pType;
+                long pFlags;
+                long pOffset;
+                long pVaddr;
+                long pFilesz;
+                long pMemsz;
+                if (is64) {
+                    pType = pb.getInt() & 0xffffffffL;
+                    pFlags = pb.getInt() & 0xffffffffL;
+                    pOffset = pb.getLong();
+                    pVaddr = pb.getLong();
+                    pb.getLong(); // p_paddr
+                    pFilesz = pb.getLong();
+                    pMemsz = pb.getLong();
+                } else {
+                    pType = pb.getInt() & 0xffffffffL;
+                    pOffset = pb.getInt() & 0xffffffffL;
+                    pVaddr = pb.getInt() & 0xffffffffL;
+                    pb.getInt(); // p_paddr
+                    pFilesz = pb.getInt() & 0xffffffffL;
+                    pMemsz = pb.getInt() & 0xffffffffL;
+                    pFlags = pb.getInt() & 0xffffffffL;
+                }
+                if (pType != PT_LOAD || pFilesz <= 0) continue;
+                long segEnd = pOffset + pFilesz;
+                // Overlap of .text file range with segment file range.
+                if (textOffset >= segEnd || textEnd <= pOffset) continue;
+                boolean exec = (pFlags & PF_X) != 0;
+                long[] cand = new long[]{pOffset, pVaddr, pFilesz, pMemsz, pFlags};
+                if (best == null || (exec && !bestExec)) {
+                    best = cand;
+                    bestExec = exec;
+                }
+            }
+            return best != null ? best : none;
+        } catch (Exception ignored) {
+            return none;
+        }
     }
 
     private static void writeU16(ByteArrayOutputStream bos, int v) {

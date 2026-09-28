@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.1
+
+- SO protect runtime: Application attach no longer RC4/pins the full keyed table.
+  Keyed SOs map packaged extract and decrypt `.text` in RAM (opportunistic L2e);
+  packer `so_text_diag` v2 `l2e` marks true Class B megacores. Background
+  `so_plain` fill is delayed past first frame.
+- Desktop / installer / packer jar / native version **0.7.1**.
+
 ## 0.6.30
 
 - Desktop / installer / packer jar / native version **0.6.30**.

@@ -114,6 +114,8 @@ public class PackerMain {
     private final java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
     /** Runtime SO decrypt timing — default eager (full materialize + preload). */
     private ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
+    /** Release-visible [XOP-SO] diagnostics via config.json so_diag. */
+    private boolean soDiag = false;
     /** Per-APK PVM2 opcode morph (Phase 3); set in protect(). */
     private Pvm2Morph pvm2Morph;
     /** True-VMP compile telemetry (PR6). Does not change admission. */
@@ -172,6 +174,7 @@ public class PackerMain {
         }
         soDecryptMode = options.soDecryptMode != null
                 ? options.soDecryptMode : ProtectOptions.SoDecryptMode.EAGER;
+        soDiag = options.soDiag;
         applicationOverride = options.applicationOverride;
         certSha256Override = options.certSha256Override;
         riskFlags = options.riskFlags;
@@ -322,6 +325,7 @@ public class PackerMain {
                 + "[--protect-so-abi <abi>|all] "
                 + "[--protect-so-exclude <liba.so,libb.so>] "
                 + "[--so-decrypt-mode eager|lazy] "
+                + "[--so-diag] "
                 + "[--application <real.Application>] "
                 + "[--cert-sha256 <hex>] "
                 + "[--risk-flags <int>] [--rasp-action <0|1|2>] [--report-enabled <0|1>] "
@@ -367,6 +371,8 @@ public class PackerMain {
         System.err.println("  --so-decrypt-mode  eager (default)=full materialize+preload at cold start;");
         System.err.println("                     lazy=on-demand + background fill (this process only)");
         System.err.println("                     Prefer loadLibrary after Application attach.");
+        System.err.println("  --so-diag          embed so_diag=true (Release [XOP-SO] logs; or setprop");
+        System.err.println("                     debug.protector.so_diag=1)");
         System.err.println("  --risk-flags      bitmask (default 48 = disable Root+Emulator)");
         System.err.println("  --rasp-action     0=alert 1=degrade 2=block (default 2)");
         System.err.println("  --report-enabled  threat log/ring (default 1)");
@@ -403,6 +409,7 @@ public class PackerMain {
         String protectSoAbi = "all";
         java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
         ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
+        boolean soDiag = false;
         ProtectPolicy.Profile profile = ProtectPolicy.Profile.BALANCED;
         List<String> hollowPrefixes = new ArrayList<>();
         List<String> vmpPrefixes = new ArrayList<>();
@@ -474,6 +481,8 @@ public class PackerMain {
                 }
             } else if ("--so-decrypt-mode".equals(args[i]) && i + 1 < args.length) {
                 soDecryptMode = ProtectOptions.parseSoDecryptMode(args[++i]);
+            } else if ("--so-diag".equals(args[i])) {
+                soDiag = true;
             } else if ("--application".equals(args[i]) && i + 1 < args.length) {
                 applicationOverride = args[++i];
             } else if ("--cert-sha256".equals(args[i]) && i + 1 < args.length) {
@@ -556,6 +565,7 @@ public class PackerMain {
         options.protectSoExclude.clear();
         options.protectSoExclude.addAll(protectSoExclude);
         options.soDecryptMode = soDecryptMode;
+        options.soDiag = soDiag;
         options.applicationOverride = applicationOverride;
         options.certSha256Override = certSha256Override;
         if (riskFlagsOverride != null) {
@@ -758,6 +768,12 @@ public class PackerMain {
                 } else {
                     System.out.println("WARN: SO protect enabled but no encryptable business .so found");
                 }
+                // Pack↔runtime .text integrity expected values (diagnostic; not in sokeys).
+                String soTextDiag = BusinessSoProtector.buildSoTextDiagJson(soResult);
+                Files.writeString(new File(assetsProtector, "so_text_diag.json").toPath(),
+                        soTextDiag, StandardCharsets.UTF_8);
+                System.out.println("Wrote so_text_diag.json encrypted="
+                        + soResult.encrypted.size());
             }
 
             int assetsEncrypted = 0;
@@ -781,7 +797,7 @@ public class PackerMain {
 
             // config.json — AES/HMAC keys are HKDF-derived at runtime, not stored here.
             // HMAC-SHA256 protects risk_flags / rasp_action / app_sign_sha256 / protect_so /
-            // encrypt_assets / net_guard / so_decrypt_mode / package / vmp_lru /
+            // encrypt_assets / net_guard / so_decrypt_mode / so_diag / package / vmp_lru /
             // dex_hmac / code_hmac / code_methods_hmac / bitcode_hmac.
             boolean netGuardOn = detectProxy || !pinCertSha256.isEmpty();
             if (netGuardOn) {
@@ -794,6 +810,7 @@ public class PackerMain {
                             + "\"risk_flags\":%d,\"rasp_action\":%d,\"report_enabled\":%s,"
                             + "\"app_sign_sha256\":\"%s\",\"protect_so\":%s,\"encrypt_assets\":%s,"
                             + "\"detect_proxy\":%s,\"net_guard\":%s,\"so_decrypt_mode\":\"%s\","
+                            + "\"so_diag\":%s,"
                             + "\"package\":\"%s\",\"vmp_lru\":%d,\"dex_hmac\":\"%s\","
                             + "\"code_hmac\":\"%s\",\"code_methods_hmac\":\"%s\",\"bitcode_hmac\":%s",
                     escapeJson(originalApp == null ? "" : originalApp), xorKey,
@@ -803,6 +820,7 @@ public class PackerMain {
                     detectProxy ? "true" : "false",
                     netGuardOn ? "true" : "false",
                     soDecryptWire,
+                    soDiag ? "true" : "false",
                     escapeJson(packageName),
                     32,
                     dexHmacHex,
@@ -819,6 +837,7 @@ public class PackerMain {
                     + " report_enabled=" + reportEnabled
                     + " protect_so=" + wroteSokeys
                     + " so_decrypt_mode=" + soDecryptWire
+                    + " so_diag=" + soDiag
                     + " vmp_lru=32"
                     + " dex_hmac=set"
                     + " code_hmac=set"
@@ -883,6 +902,14 @@ public class PackerMain {
             System.out.println("=== size_report ===");
             System.out.print(sizeReport);
             System.out.println("Wrote " + reportBeside.getAbsolutePath());
+            if (soResult != null) {
+                File diagBeside = new File(outputApk.getParentFile(),
+                        outputApk.getName().replace(".apk", "") + "-so_text_diag.json");
+                Files.writeString(diagBeside.toPath(),
+                        BusinessSoProtector.buildSoTextDiagJson(soResult),
+                        StandardCharsets.UTF_8);
+                System.out.println("Wrote " + diagBeside.getAbsolutePath());
+            }
             if (soResult != null && soResult.budgetTruncated) {
                 System.out.println("WARN: SO size-budget truncated — see so_skipped_budget in size_report");
                 progress.onWarn("SO size-budget truncated — see so_skipped_budget in size_report");
@@ -1410,12 +1437,12 @@ public class PackerMain {
         return new int[]{autoPayTypes, autoIndustryTypes, autoPayMethods, autoIndustryMethods};
     }
 
-    private static String methodKey(InsnRecord rec) {
+    static String methodKey(InsnRecord rec) {
         return methodKey(rec.definingClass, rec.methodName, rec.paramTypes, rec.returnType);
     }
 
-    private static String methodKey(String definingClass, String name, String[] params,
-                                    String returnType) {
+    static String methodKey(String definingClass, String name, String[] params,
+                            String returnType) {
         StringBuilder sb = new StringBuilder();
         sb.append(definingClass).append('#').append(name).append('(');
         if (params != null) {
@@ -1433,13 +1460,13 @@ public class PackerMain {
      */
     private void rematchMethodIndices(File dexFile, List<InsnRecord> records) throws IOException {
         com.android.dex.Dex dex = new com.android.dex.Dex(Files.readAllBytes(dexFile.toPath()));
+        Map<String, Integer> bySignature = indexMethodIds(dex);
         for (InsnRecord rec : records) {
             if (rec.definingClass == null) {
                 continue;
             }
-            int idx = findMethodIndex(dex, rec.definingClass, rec.methodName,
-                    rec.paramTypes, rec.returnType);
-            if (idx < 0) {
+            Integer idx = bySignature.get(methodKey(rec));
+            if (idx == null) {
                 throw new IOException("rematch failed for " + rec.definingClass
                         + "->" + rec.methodName);
             }
@@ -1447,47 +1474,30 @@ public class PackerMain {
         }
     }
 
-    private static int findMethodIndex(com.android.dex.Dex dex, String definingClass,
-                                       String name, String[] params, String returnType) {
-        if (params == null) {
-            params = new String[0];
-        }
+    /** One pass over method_ids. First id wins, matching the old linear scan. */
+    private static Map<String, Integer> indexMethodIds(com.android.dex.Dex dex) {
         List<com.android.dex.MethodId> methods = dex.methodIds();
+        Map<String, Integer> map = new HashMap<>(Math.max(16, methods.size() * 2));
         for (int i = 0; i < methods.size(); i++) {
             com.android.dex.MethodId mid = methods.get(i);
-            if (!dex.typeNames().get(mid.getDeclaringClassIndex()).equals(definingClass)) {
-                continue;
-            }
-            if (!dex.strings().get(mid.getNameIndex()).equals(name)) {
-                continue;
-            }
+            String definingClass = dex.typeNames().get(mid.getDeclaringClassIndex());
+            String name = dex.strings().get(mid.getNameIndex());
             com.android.dex.ProtoId proto = dex.protoIds().get(mid.getProtoIndex());
-            if (!dex.typeNames().get(proto.getReturnTypeIndex()).equals(returnType)) {
-                continue;
-            }
-            List<String> got = new ArrayList<>();
+            String returnType = dex.typeNames().get(proto.getReturnTypeIndex());
+            String[] params;
             int paramOff = proto.getParametersOffset();
-            if (paramOff != 0) {
-                com.android.dex.TypeList typeList = dex.readTypeList(paramOff);
-                for (short t : typeList.getTypes()) {
-                    got.add(dex.typeNames().get(t & 0xffff));
+            if (paramOff == 0) {
+                params = new String[0];
+            } else {
+                short[] types = dex.readTypeList(paramOff).getTypes();
+                params = new String[types.length];
+                for (int p = 0; p < types.length; p++) {
+                    params[p] = dex.typeNames().get(types[p] & 0xffff);
                 }
             }
-            if (got.size() != params.length) {
-                continue;
-            }
-            boolean ok = true;
-            for (int p = 0; p < params.length; p++) {
-                if (!got.get(p).equals(params[p])) {
-                    ok = false;
-                    break;
-                }
-            }
-            if (ok) {
-                return i;
-            }
+            map.putIfAbsent(methodKey(definingClass, name, params, returnType), i);
         }
-        return -1;
+        return map;
     }
 
     /** Hollow / VMP / auto payment True-VMP candidates. */

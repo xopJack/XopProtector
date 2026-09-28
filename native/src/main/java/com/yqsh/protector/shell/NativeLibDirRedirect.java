@@ -7,24 +7,37 @@ import android.util.Log;
 import androidx.annotation.Keep;
 
 import java.io.File;
+import java.lang.reflect.Array;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * Point native lib search at protector {@code so_plain} so encrypted business SOs
- * resolve to materialized plaintext.
+ * Native lib path policy for protect-so.
  * <p>
- * {@link ApplicationInfo#nativeLibraryDir} is redirected to {@code so_plain} so
- * path-sensitive native code sees keyed SOs under the app's lib dir. Keyed
- * {@code dlopen} still prefers L1/L2 extract-path equivalence (see
- * {@code docs/so-load-contract.md}).
+ * <b>Do not</b> rewrite {@link ApplicationInfo#nativeLibraryDir} to
+ * {@code lib_mirror}/{@code so_plain}. Hi-MC / Teigha / OSG path-sensitive
+ * megacores ({@code libd3}, {@code libzhd3d}) require the stock packaged
+ * extract path ({@code /data/app/.../lib/&lt;abi&gt;}) for
+ * {@code ApplicationInfo}, {@code dladdr}, and {@code /proc/self/maps}
+ * dirname semantics. Decrypt is proven bit-identical to the original SO;
+ * wrong display was caused by path redirect, not RC4.
  * <p>
- * Non-keyed deps in {@code so_plain} are <b>symlinks</b> to the packaged extract
- * (native {@code copy_plain_deps}) — same inode as {@code /data/app/.../lib},
- * avoiding dual {@code libc++_shared} / GLES mappings that broke large OSG SOs.
+ * Keyed loads go through native dlopen hooks: L1 publish onto extract when
+ * writable; path-sensitive megacores (large Teigha/OSG) map the packaged
+ * extract inode and decrypt {@code .text} in memory; other keyed SOs use
+ * helper-first {@code so_plain}/{@code lib_mirror} so {@code loadLibrary}
+ * never maps packaged ciphertext (e.g. {@code libxcrash} SIGILL).
+ * {@code lib_mirror} remains a helper tree but must not become
+ * {@code nativeLibraryDir}.
  * <p>
- * ClassLoader still prepends {@code so_plain} so basename {@code loadLibrary}
- * finds plaintext when dlopen hooks fail; packaged extract remains a fallback
- * for excluded / unkeyed libs.
+ * ClassLoader searches the plaintext helper <b>first</b> so {@code loadLibrary}
+ * never maps packaged ciphertext (aggressive encrypts industry libs such as
+ * {@code libxcrash}; ART {@code LoadNativeLibrary} would SIGILL in
+ * {@code JNI_OnLoad}). {@code lib_mirror}/{@code so_plain} first, packaged
+ * extract as fallback. {@link ApplicationInfo#nativeLibraryDir} stays packaged.
  * <p>
  * APK-agnostic — no customer package names.
  */
@@ -41,44 +54,52 @@ final class NativeLibDirRedirect {
         File plain = apply(ai, protectorDir);
         if (plain == null) return;
         try {
-            Object loadedApk = getField(context, "mPackageInfo");
-            if (loadedApk == null) {
-                loadedApk = getField(context.getApplicationContext(), "mPackageInfo");
-            }
-            bindLoadedApkPlain(loadedApk, plain.getAbsolutePath());
-            patchClassLoader(context.getClassLoader(), plain.getAbsolutePath());
+            // Keep LoadedApk / ApplicationInfo on packaged extract.
+            String packaged = ai != null ? ai.nativeLibraryDir : null;
+            patchClassLoader(context.getClassLoader(), plain.getAbsolutePath(), packaged);
         } catch (Throwable t) {
-            Log.w(TAG, "LoadedApk bind skipped", t);
+            Log.w(TAG, "ClassLoader patch skipped", t);
         }
+    }
+
+    /**
+     * Prefer {@code lib_mirror} when populated; else {@code so_plain}.
+     * Used only as ClassLoader <b>fallback</b> after packaged extract.
+     */
+    static File resolveLibDir(File protectorDir) {
+        if (protectorDir == null) return null;
+        File mirror = new File(protectorDir, "lib_mirror");
+        if (mirror.isDirectory()) {
+            String[] kids = mirror.list();
+            if (kids != null && kids.length > 0) return mirror;
+        }
+        File plain = new File(protectorDir, "so_plain");
+        if (plain.isDirectory()) return plain;
+        return null;
     }
 
     /**
      * Used from AppComponentFactory before a Context exists.
-     * Callers must {@code setNativeLibraryDir(packaged)} <b>before</b> this so
-     * native materialize still reads ciphertext from the extract dir.
-     * @return {@code so_plain} dir if usable, else null
+     * Callers must {@code setNativeLibraryDir(packaged)} before init.
+     * <b>Does not</b> change {@code ai.nativeLibraryDir}.
+     * @return plaintext helper dir for ClassLoader fallback, else null
      */
     static File apply(ApplicationInfo ai, File protectorDir) {
         if (ai == null || protectorDir == null) return null;
-        File plain = new File(protectorDir, "so_plain");
-        if (!plain.isDirectory()) {
-            return null; // protect-so off or no keyed SOs
+        File plain = resolveLibDir(protectorDir);
+        if (plain == null) {
+            return null;
         }
         String original = ai.nativeLibraryDir;
-        if (original == null || original.isEmpty()) return plain;
-        String plainPath = plain.getAbsolutePath();
-        if (plainPath.equals(original)) {
-            return plain;
-        }
-        ai.nativeLibraryDir = plainPath;
-        Log.i(TAG, "nativeLibraryDir -> so_plain: " + plainPath
-                + " (packaged was " + original + ")");
+        Log.i(TAG, "nativeLibraryDir kept packaged=" + original
+                + " (plaintext helper=" + plain.getName() + ", not redirected)");
         return plain;
     }
 
     /**
-     * Prepend {@code so_plain} on the ClassLoader native lib path so keyed
-     * basename loads resolve plaintext before packaged ciphertext.
+     * Plaintext helper first so {@code loadLibrary} never maps packaged
+     * ciphertext. Packaged extract is fallback. {@link ApplicationInfo#nativeLibraryDir}
+     * stays packaged (see {@link #apply}).
      */
     static void patchClassLoader(ClassLoader cl, String plainDir) {
         patchClassLoader(cl, plainDir, null);
@@ -89,51 +110,120 @@ final class NativeLibDirRedirect {
         try {
             Object pathList = getField(cl, "pathList");
             if (pathList == null) return;
+
+            // findLibrary() only walks nativeLibraryPathElements. Updating
+            // nativeLibraryDirectories alone is a no-op on API 26+ if
+            // makePathElements(List) is missing — ART then maps packaged
+            // ciphertext (Hi-MC System.loadLibrary("cpbase") SIGILL).
+            List<File> helpers = new ArrayList<>();
+            File primary = new File(plainDir);
+            helpers.add(primary);
+            File parent = primary.getParentFile();
+            if (parent != null) {
+                File soPlain = new File(parent, "so_plain");
+                if (soPlain.isDirectory() && !soPlain.equals(primary)) {
+                    helpers.add(soPlain);
+                }
+            }
+
             Object dirsObj = getField(pathList, "nativeLibraryDirectories");
-            if (dirsObj instanceof java.util.List) {
+            if (dirsObj instanceof List) {
                 @SuppressWarnings("unchecked")
-                java.util.List<File> dirs = (java.util.List<File>) dirsObj;
-                File plain = new File(plainDir);
-                dirs.remove(plain);
-                dirs.add(0, plain);
-                // Packaged extract as fallback (excluded / non-keyed SOs still live there).
-                // GLES stubs must not be loaded from there after system GLES is bound —
-                // native copy_plain_deps never plants GLES in so_plain.
+                List<File> dirs = (List<File>) dirsObj;
+                if (packagedDir != null && !packagedDir.isEmpty()) {
+                    dirs.remove(new File(packagedDir));
+                }
+                for (int i = helpers.size() - 1; i >= 0; i--) {
+                    File h = helpers.get(i);
+                    dirs.remove(h);
+                    dirs.add(0, h);
+                }
                 if (packagedDir != null && !packagedDir.isEmpty()) {
                     File packaged = new File(packagedDir);
                     dirs.remove(packaged);
-                    if (dirs.size() <= 1) {
-                        dirs.add(packaged);
-                    } else {
-                        dirs.add(1, packaged);
-                    }
+                    int insert = Math.min(helpers.size(), dirs.size());
+                    dirs.add(insert, packaged);
                 }
             }
-            try {
-                java.lang.reflect.Method makePathElements = pathList.getClass()
-                        .getDeclaredMethod("makePathElements", java.util.List.class);
-                makePathElements.setAccessible(true);
-                @SuppressWarnings("unchecked")
-                java.util.List<File> dirs = (java.util.List<File>) getField(pathList, "nativeLibraryDirectories");
-                Object elements = makePathElements.invoke(null, dirs);
-                setField(pathList, "nativeLibraryPathElements", elements);
-            } catch (NoSuchMethodException e) {
-                // Older API: makePathElements(List, File, List) for dex — skip
-            }
-            Log.i(TAG, "ClassLoader native lib path: so_plain first; plain=" + plainDir);
+
+            boolean rebuilt = rebuildNativeLibraryPathElements(pathList, helpers);
+            boolean prepended = prependNativeLibraryElements(pathList, helpers);
+            boolean elementsOk = rebuilt || prepended;
+            Log.i(TAG, "ClassLoader native lib path: helper first, packaged fallback; helper="
+                    + plainDir + " pathElements=" + (elementsOk ? "ok" : "UNPATCHED"));
         } catch (Throwable t) {
             Log.w(TAG, "patchClassLoader failed", t);
         }
     }
 
-    /** Bind LoadedApk native lib dir to so_plain (matches ApplicationInfo). */
-    private static void bindLoadedApkPlain(Object loadedApk, String plainPath) {
-        if (loadedApk == null || plainPath == null) return;
-        Object appInfo = getField(loadedApk, "mApplicationInfo");
-        if (appInfo instanceof ApplicationInfo) {
-            ((ApplicationInfo) appInfo).nativeLibraryDir = plainPath;
+    /** DexPathList.makePathElements(List) — static on AOSP, often absent/overloaded on OEM. */
+    private static boolean rebuildNativeLibraryPathElements(Object pathList, List<File> helpers) {
+        Object dirsObj = getField(pathList, "nativeLibraryDirectories");
+        if (!(dirsObj instanceof List)) return false;
+        Class<?> clz = pathList.getClass();
+        while (clz != null) {
+            for (String name : new String[]{"makePathElements", "makeNativePathElements"}) {
+                try {
+                    Method m = clz.getDeclaredMethod(name, List.class);
+                    if (m.getReturnType().isArray()) {
+                        m.setAccessible(true);
+                        Object elements = m.invoke(null, dirsObj);
+                        if (elements != null) {
+                            setField(pathList, "nativeLibraryPathElements", elements);
+                            return true;
+                        }
+                    }
+                } catch (NoSuchMethodException ignored) {
+                } catch (Throwable t) {
+                    Log.w(TAG, "rebuild pathElements via " + name + " failed", t);
+                }
+            }
+            clz = clz.getSuperclass();
         }
-        setField(loadedApk, "mNativeLibraryDir", plainPath);
+        return false;
+    }
+
+    /**
+     * Prepend DexPathList$NativeLibraryElement(File) so findLibrary hits helper
+     * dirs before the packaged extract, even when makePathElements is missing.
+     */
+    private static boolean prependNativeLibraryElements(Object pathList, List<File> helpers) {
+        Object oldObj = getField(pathList, "nativeLibraryPathElements");
+        if (oldObj == null || !oldObj.getClass().isArray() || helpers == null || helpers.isEmpty()) {
+            return false;
+        }
+        Class<?> nle = oldObj.getClass().getComponentType();
+        if (nle == null) return false;
+        Constructor<?> ctor = null;
+        for (Constructor<?> c : nle.getDeclaredConstructors()) {
+            Class<?>[] pts = c.getParameterTypes();
+            if (pts.length == 1 && pts[0] == File.class) {
+                ctor = c;
+                break;
+            }
+        }
+        if (ctor == null) return false;
+        ctor.setAccessible(true);
+        try {
+            int oldLen = Array.getLength(oldObj);
+            List<Object> created = new ArrayList<>();
+            for (File h : helpers) {
+                created.add(ctor.newInstance(h));
+            }
+            Object neu = Array.newInstance(nle, created.size() + oldLen);
+            int i = 0;
+            for (Object el : created) {
+                Array.set(neu, i++, el);
+            }
+            for (int j = 0; j < oldLen; j++) {
+                Array.set(neu, i++, Array.get(oldObj, j));
+            }
+            setField(pathList, "nativeLibraryPathElements", neu);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "prepend NativeLibraryElement failed", t);
+            return false;
+        }
     }
 
     private static Object getField(Object obj, String name) {

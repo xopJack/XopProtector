@@ -78,6 +78,17 @@ public class ProxyApplication extends Application {
     private static final String NETGUARD_JSON = StrEnc.d(new byte[]{
             0x34, 0x24, 0x18, 0x6c, 0x43, (byte)0xbc, (byte)0x8a, (byte)0x83, (byte)0xac, (byte)0xc3, 0x27, 0x1c, 0x70
     });
+    // "protector/so_text_diag.json"
+    private static final String SO_TEXT_DIAG_ASSET = StrEnc.d(new byte[]{
+            0x2a, 0x33, 0x03, 0x7f, 0x53, (byte)0xbe, (byte)0x8c, (byte)0x88, (byte)0xf0, (byte)0x86,
+            0x27, 0x1c, 0x41, 0x71, 0x45, (byte)0xb7, (byte)0x9e, (byte)0xce, (byte)0xd8, 0x32,
+            0x27, 0x0a, 0x26, 0x5d, (byte)0xa1, (byte)0x96, (byte)0x8a
+    });
+    // "so_text_diag.json"
+    private static final String SO_TEXT_DIAG_JSON = StrEnc.d(new byte[]{
+            0x29, 0x2e, 0x33, 0x7f, 0x53, (byte)0xa5, (byte)0x8c, (byte)0xb8, (byte)0xe6, (byte)0xc0,
+            0x35, 0x14, 0x30, 0x6f, 0x53, (byte)0xa0, (byte)0x84
+    });
 
     private String realApplicationName = "";
     private Application realApplication;
@@ -299,8 +310,8 @@ public class ProxyApplication extends Application {
             return;
         }
         ApplicationInfo ai = context.getApplicationInfo();
-        // Packaged extract dir for JNI materialize (ciphertext source). Redirect
-        // of ApplicationInfo.nativeLibraryDir to so_plain happens after this.
+        // Packaged extract dir for JNI materialize (ciphertext source).
+        // ApplicationInfo.nativeLibraryDir stays on extract (path-sensitive OSG).
         String packagedLib = ai != null ? ai.nativeLibraryDir : null;
         if (packagedLib != null) {
             JniBridge.setNativeLibraryDir(packagedLib);
@@ -518,6 +529,8 @@ public class ProxyApplication extends Application {
         copyAsset(context, SOKEYS_ASSET, new File(outDir, SOKEYS_BIN));
         // Optional — Phase 3 NetGuard config
         copyAsset(context, NETGUARD_ASSET, new File(outDir, NETGUARD_JSON));
+        // Optional — packer so_text_diag for runtime .text integrity (P3)
+        copyAsset(context, SO_TEXT_DIAG_ASSET, new File(outDir, SO_TEXT_DIAG_JSON));
         writeStamp(outDir, new File(info.sourceDir));
         return outDir;
     }
@@ -544,6 +557,7 @@ public class ProxyApplication extends Application {
         deleteQuietly(new File(outDir, CONFIG_JSON));
         deleteQuietly(new File(outDir, SOKEYS_BIN));
         deleteQuietly(new File(outDir, NETGUARD_JSON));
+        deleteQuietly(new File(outDir, SO_TEXT_DIAG_JSON));
         // Extracted hollow dexes must not survive APK updates — DexMerger skips
         // rewrite when classes*.dex already exists with non-zero length.
         deleteExtractedDexes(outDir);
@@ -551,6 +565,7 @@ public class ProxyApplication extends Application {
         deleteQuietly(new File(new File(outDir, "so_plain"), "so_plain_ready"));
         deleteQuietly(new File(outDir, "dex_bundle.zip")); // legacy from brief experiment
         deleteDir(new File(outDir, "so_plain"));
+        deleteDir(new File(outDir, "lib_mirror"));
         deleteDir(new File(outDir, "so_cipher"));
         deleteDir(new File(outDir, "so_warm"));
         deleteQuietly(stampFile);

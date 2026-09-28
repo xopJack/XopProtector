@@ -4,42 +4,90 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
 
 namespace protector {
 
+/** Bypass libc fopen hooks (business_so may spoof /proc/self/maps for OSG). */
+static FILE* fopen_maps_raw() {
+    int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, "/proc/self/maps",
+                                      O_RDONLY | O_CLOEXEC));
+    if (fd < 0) return nullptr;
+    FILE* fp = fdopen(fd, "r");
+    if (fp == nullptr) close(fd);
+    return fp;
+}
+
+bool read_maps_record(FILE* fp, std::string* line) {
+    if (fp == nullptr || line == nullptr) return false;
+    line->clear();
+    char chunk[4096];
+    while (fgets(chunk, sizeof(chunk), fp) != nullptr) {
+        line->append(chunk);
+        if (!line->empty() && line->back() == '\n') return true;
+        if (line->size() >= static_cast<size_t>(PATH_MAX) + 256) {
+            int c = 0;
+            while ((c = fgetc(fp)) != EOF && c != '\n') {}
+            if (line->empty() || line->back() != '\n') line->push_back('\n');
+            return true;
+        }
+    }
+    return !line->empty();
+}
+
+bool maps_pathname(const std::string& line, std::string* path) {
+    if (path == nullptr) return false;
+    path->clear();
+    const char* s = line.c_str();
+    for (int field = 0; field < 5; ++field) {
+        while (*s == ' ' || *s == '\t') ++s;
+        if (*s == '\0' || *s == '\n') return false;
+        while (*s != '\0' && *s != ' ' && *s != '\t' && *s != '\n') ++s;
+    }
+    while (*s == ' ' || *s == '\t') ++s;
+    if (*s == '\0' || *s == '\n') return false;
+    const char* end = s;
+    while (*end != '\0' && *end != '\n' && *end != '\r') ++end;
+    while (end > s && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    static constexpr char kDeleted[] = " (deleted)";
+    constexpr size_t kDeletedLen = sizeof(kDeleted) - 1;
+    if (static_cast<size_t>(end - s) >= kDeletedLen
+            && memcmp(end - kDeletedLen, kDeleted, kDeletedLen) == 0) {
+        end -= kDeletedLen;
+        while (end > s && (end[-1] == ' ' || end[-1] == '\t')) --end;
+    }
+    size_t n = static_cast<size_t>(end - s);
+    if (n >= static_cast<size_t>(PATH_MAX)) n = static_cast<size_t>(PATH_MAX) - 1;
+    path->assign(s, n);
+    return !path->empty();
+}
+
 std::string find_so_path(const char* so_name) {
     if (so_name == nullptr || so_name[0] == 0) return {};
-    char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", getpid());
-    FILE* fp = fopen(maps_path, "r");
+    FILE* fp = fopen_maps_raw();
     if (!fp) return {};
-
-#ifdef __LP64__
-    const char* fmt = "%*llx-%*llx %*s %*llx %*s %*s %255s";
-#else
-    const char* fmt = "%*x-%*x %*s %*x %*s %*s %255s";
-#endif
 
     // Prefer protector so_plain mirror (plaintext) over /data/app packaged ciphertext.
     std::string plain_hit;
     std::string any_hit;
-    char line[512];
+    std::string line;
     int lines = 0;
-    while (fgets(line, sizeof(line), fp) != nullptr && lines++ < 10000) {
-        char path[256] = {0};
-        if (sscanf(line, fmt, path) != 1) continue;
-        const char* base = strrchr(path, '/');
-        base = base ? base + 1 : path;
+    while (read_maps_record(fp, &line) && lines++ < 10000) {
+        std::string path;
+        if (!maps_pathname(line, &path)) continue;
+        const char* base = strrchr(path.c_str(), '/');
+        base = base != nullptr ? base + 1 : path.c_str();
         if (strcmp(base, so_name) != 0) continue;
-        if (strstr(path, "/so_plain/") != nullptr) {
-            plain_hit = path;
+        if (path.find("/lib_mirror/") != std::string::npos
+                || path.find("/so_plain/") != std::string::npos) {
+            plain_hit = std::move(path);
             break;
         }
-        if (any_hit.empty()) {
-            any_hit = path;
-        }
+        if (any_hit.empty()) any_hit = std::move(path);
     }
     fclose(fp);
     return !plain_hit.empty() ? plain_hit : any_hit;
@@ -144,18 +192,18 @@ bool find_so_load_bias(const char* so_name, uintptr_t* out_bias) {
     std::string path = find_so_path(so_name);
     if (path.empty()) return false;
 
-    FILE* fp = fopen("/proc/self/maps", "r");
+    FILE* fp = fopen_maps_raw();
     if (!fp) return false;
     uintptr_t map_start = 0;
     bool found_map = false;
-    char line[512];
-    while (fgets(line, sizeof(line), fp)) {
+    std::string line;
+    while (read_maps_record(fp, &line)) {
         // Prefer exact path match for the resolved ELF (so_plain over packaged).
-        bool path_hit = !path.empty() && strstr(line, path.c_str()) != nullptr;
+        bool path_hit = !path.empty() && line.find(path) != std::string::npos;
         if (!path_hit) continue;
-        if (strchr(line, '/') == nullptr) continue;
+        if (line.find('/') == std::string::npos) continue;
         unsigned long start = 0;
-        if (sscanf(line, "%lx-", &start) == 1) {
+        if (sscanf(line.c_str(), "%lx-", &start) == 1) {
             map_start = static_cast<uintptr_t>(start);
             found_map = true;
             break;

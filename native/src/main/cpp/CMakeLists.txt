@@ -70,9 +70,10 @@ target_include_directories(protector PRIVATE
 )
 
 target_compile_options(protector PRIVATE -Wall -Wextra)
-# ARM64 PAC + BTI: protect against ROP / JOP on ARMv8.3+ devices.
+# Hi-MC field tablets are often pre-ARMv8.3; paciasp/BTI → SIGILL on load.
+# Keep ROP hardening off until we gate by HWCAP_AP at runtime.
 if (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
-    target_compile_options(protector PRIVATE -mbranch-protection=standard)
+    target_compile_options(protector PRIVATE -mbranch-protection=none)
 endif()
 target_link_options(protector PRIVATE "-Wl,-z,max-page-size=16384")
 

@@ -129,6 +129,16 @@ public class ProxyComponentFactory extends AppComponentFactory {
                         })));
             } catch (Throwable ignored) {
             }
+            // Optional — packer so_text_diag for runtime .text integrity checks
+            try {
+                extractFromApk(apk, "assets/protector/so_text_diag.json", new File(codeCache,
+                        StrEnc.d(new byte[]{
+                                0x29, 0x2e, 0x33, 0x7f, 0x53, (byte)0xa5, (byte)0x8c, (byte)0xb8,
+                                (byte)0xe6, (byte)0xc0, 0x35, 0x14, 0x30, 0x6f, 0x53, (byte)0xa0,
+                                (byte)0x84
+                        })));
+            } catch (Throwable ignored) {
+            }
             ProxyApplication.writeStamp(codeCache, apk);
 
             System.loadLibrary("protector");
@@ -137,12 +147,15 @@ public class ProxyComponentFactory extends AppComponentFactory {
                 JniBridge.setNativeLibraryDir(aInfo.nativeLibraryDir);
             }
             JniBridge.initApp(codeCache.getAbsolutePath(), aInfo.packageName, aInfo.sourceDir);
-            // nativeLibraryDir → so_plain for path-sensitive dladdr; ClassLoader
-            // still keeps packaged extract as fallback for excluded/unkeyed SOs.
+            // Keep ApplicationInfo.nativeLibraryDir on packaged extract (path-sensitive
+            // OSG/Teigha). ClassLoader: plaintext helper first so keyed SOs are not
+            // mapped from extract ciphertext (libxcrash JNI_OnLoad SIGILL).
             String packaged = aInfo.nativeLibraryDir;
-            NativeLibDirRedirect.apply(aInfo, codeCache);
-            NativeLibDirRedirect.patchClassLoader(cl,
-                    new File(codeCache, "so_plain").getAbsolutePath(), packaged);
+            File helper = NativeLibDirRedirect.apply(aInfo, codeCache);
+            if (helper != null) {
+                NativeLibDirRedirect.patchClassLoader(cl,
+                        helper.getAbsolutePath(), packaged);
+            }
             DexMerger.merge(cl, codeCache);
             JniBridge.finishBusinessSoDecrypt();
             JniBridge.enableJunkVerify();

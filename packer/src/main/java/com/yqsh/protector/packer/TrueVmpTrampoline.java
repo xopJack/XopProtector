@@ -31,8 +31,10 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -79,10 +81,11 @@ public final class TrueVmpTrampoline {
         }
 
         com.android.dex.Dex dex = new com.android.dex.Dex(Files.readAllBytes(dexFile.toPath()));
+        Map<String, Integer> codeOffsets = indexCodeOffsets(dex);
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(dexFile, "rw")) {
             for (PackerMain.InsnRecord rec : trueVmp) {
-                int codeOff = findCodeOffset(dex, rec.definingClass, rec.methodName,
-                        rec.paramTypes, rec.returnType);
+                Integer codeOffBoxed = codeOffsets.get(PackerMain.methodKey(rec));
+                int codeOff = codeOffBoxed == null ? -1 : codeOffBoxed;
                 if (codeOff <= 0) {
                     throw new IOException("TRUE_VMP rebind: no code for "
                             + rec.definingClass + "->" + rec.methodName);
@@ -118,66 +121,53 @@ public final class TrueVmpTrampoline {
                             + String.format("%02x %02x … %02x %02x",
                             head[0] & 0xff, head[1] & 0xff, head[6] & 0xff, head[7] & 0xff));
                 }
-                System.out.println("TRUE_VMP rebind " + rec.definingClass + "->" + rec.methodName
-                        + " methodIdx=" + rec.methodIndex);
             }
         }
+        System.out.println("TRUE_VMP rebind methods=" + trueVmp.size());
     }
 
-    private static int findCodeOffset(com.android.dex.Dex dex, String definingClass,
-                                      String name, String[] params, String returnType) {
-        if (params == null) {
-            params = new String[0];
-        }
+    /** Signature → code_item offset. Methods without code are omitted. First hit wins. */
+    private static Map<String, Integer> indexCodeOffsets(com.android.dex.Dex dex) {
+        Map<String, Integer> map = new HashMap<>();
         for (com.android.dex.ClassDef classDef : dex.classDefs()) {
             if (classDef.getClassDataOffset() == 0) {
                 continue;
             }
-            if (!dex.typeNames().get(classDef.getTypeIndex()).equals(definingClass)) {
-                continue;
-            }
+            String definingClass = dex.typeNames().get(classDef.getTypeIndex());
             com.android.dex.ClassData classData = dex.readClassData(classDef);
-            for (com.android.dex.ClassData.Method method : classData.getDirectMethods()) {
-                if (methodMatches(dex, method, name, params, returnType)) {
-                    return method.getCodeOffset();
-                }
-            }
-            for (com.android.dex.ClassData.Method method : classData.getVirtualMethods()) {
-                if (methodMatches(dex, method, name, params, returnType)) {
-                    return method.getCodeOffset();
-                }
-            }
+            indexCodeOffsets(dex, map, definingClass, classData.getDirectMethods());
+            indexCodeOffsets(dex, map, definingClass, classData.getVirtualMethods());
         }
-        return -1;
+        return map;
     }
 
-    private static boolean methodMatches(com.android.dex.Dex dex,
-                                         com.android.dex.ClassData.Method method,
-                                         String name, String[] params, String returnType) {
-        com.android.dex.MethodId mid = dex.methodIds().get(method.getMethodIndex());
-        if (!dex.strings().get(mid.getNameIndex()).equals(name)) {
-            return false;
-        }
-        com.android.dex.ProtoId proto = dex.protoIds().get(mid.getProtoIndex());
-        if (!dex.typeNames().get(proto.getReturnTypeIndex()).equals(returnType)) {
-            return false;
-        }
-        java.util.List<String> got = new java.util.ArrayList<>();
-        int paramOff = proto.getParametersOffset();
-        if (paramOff != 0) {
-            for (short t : dex.readTypeList(paramOff).getTypes()) {
-                got.add(dex.typeNames().get(t & 0xffff));
+    private static void indexCodeOffsets(com.android.dex.Dex dex, Map<String, Integer> map,
+                                         String definingClass,
+                                         com.android.dex.ClassData.Method[] methods) {
+        for (com.android.dex.ClassData.Method method : methods) {
+            if (method.getCodeOffset() == 0) {
+                continue;
             }
-        }
-        if (got.size() != params.length) {
-            return false;
-        }
-        for (int i = 0; i < params.length; i++) {
-            if (!got.get(i).equals(params[i])) {
-                return false;
+            com.android.dex.MethodId mid = dex.methodIds().get(method.getMethodIndex());
+            com.android.dex.ProtoId proto = dex.protoIds().get(mid.getProtoIndex());
+            String[] params;
+            int paramOff = proto.getParametersOffset();
+            if (paramOff == 0) {
+                params = new String[0];
+            } else {
+                short[] types = dex.readTypeList(paramOff).getTypes();
+                params = new String[types.length];
+                for (int i = 0; i < types.length; i++) {
+                    params[i] = dex.typeNames().get(types[i] & 0xffff);
+                }
             }
+            map.putIfAbsent(PackerMain.methodKey(
+                    definingClass,
+                    dex.strings().get(mid.getNameIndex()),
+                    params,
+                    dex.typeNames().get(proto.getReturnTypeIndex())),
+                    method.getCodeOffset());
         }
-        return method.getCodeOffset() != 0;
     }
 
     public static void rewrite(File dexFile, List<Target> targets) throws IOException {
@@ -192,30 +182,40 @@ public final class TrueVmpTrampoline {
             }
             want.add(t.methodIndex);
         }
+        System.out.println("TRUE_VMP trampoline rewriting methods=" + want.size()
+                + " dexIndex=" + dexIndex);
 
         DexBackedDexFile dex;
         try (BufferedInputStream in = new BufferedInputStream(new FileInputStream(dexFile))) {
             dex = DexBackedDexFile.fromInputStream(Opcodes.getDefault(), in);
         }
+        Map<String, Integer> methodIndex = indexMethodSection(dex);
 
         List<ClassDef> outClasses = new ArrayList<>();
         int rewritten = 0;
         for (ClassDef cls : dex.getClasses()) {
+            boolean touched = false;
             List<Method> directs = new ArrayList<>();
             List<Method> virtuals = new ArrayList<>();
             for (Method m : cls.getDirectMethods()) {
-                Method r = maybeRewrite(dex, m, want, dexIndex);
+                Method r = maybeRewrite(m, methodIndex, want, dexIndex);
                 if (r != m) {
                     rewritten++;
+                    touched = true;
                 }
                 directs.add(r);
             }
             for (Method m : cls.getVirtualMethods()) {
-                Method r = maybeRewrite(dex, m, want, dexIndex);
+                Method r = maybeRewrite(m, methodIndex, want, dexIndex);
                 if (r != m) {
                     rewritten++;
+                    touched = true;
                 }
                 virtuals.add(r);
+            }
+            if (!touched) {
+                outClasses.add(cls);
+                continue;
             }
             outClasses.add(new ImmutableClassDef(
                     cls.getType(),
@@ -246,10 +246,10 @@ public final class TrueVmpTrampoline {
                 + " dexIndex=" + dexIndex);
     }
 
-    private static Method maybeRewrite(DexBackedDexFile dex, Method m, Set<Integer> want, int dexIndex)
-            throws IOException {
-        int idx = findMethodIndex(dex, m);
-        if (idx < 0 || !want.contains(idx)) {
+    private static Method maybeRewrite(Method m, Map<String, Integer> methodIndex,
+                                       Set<Integer> want, int dexIndex) throws IOException {
+        Integer idx = methodIndex.get(signatureKey(m));
+        if (idx == null || !want.contains(idx)) {
             return m;
         }
         if (!AccessFlags.STATIC.isSet(m.getAccessFlags())) {
@@ -267,35 +267,35 @@ public final class TrueVmpTrampoline {
                 impl);
     }
 
-    private static String describe(Method m) {
-        return m.getDefiningClass() + "->" + m.getName() + m.getReturnType();
-    }
-
-    private static int findMethodIndex(DexBackedDexFile dex, Method m) {
+    /** Signature → method_id index. First id wins, matching the old linear scan. */
+    private static Map<String, Integer> indexMethodSection(DexBackedDexFile dex) {
         var section = dex.getMethodSection();
+        Map<String, Integer> map = new HashMap<>(Math.max(16, section.size() * 2));
         for (int i = 0; i < section.size(); i++) {
             var mr = section.get(i);
-            if (mr.getDefiningClass().equals(m.getDefiningClass())
-                    && mr.getName().equals(m.getName())
-                    && mr.getReturnType().equals(m.getReturnType())
-                    && paramTypesEqual(mr.getParameterTypes(), m.getParameterTypes())) {
-                return i;
-            }
+            map.putIfAbsent(signatureKey(mr.getDefiningClass(), mr.getName(),
+                    mr.getParameterTypes(), mr.getReturnType()), i);
         }
-        return -1;
+        return map;
     }
 
-    private static boolean paramTypesEqual(List<? extends CharSequence> a,
-                                           List<? extends CharSequence> b) {
-        if (a.size() != b.size()) {
-            return false;
-        }
-        for (int i = 0; i < a.size(); i++) {
-            if (!a.get(i).toString().equals(b.get(i).toString())) {
-                return false;
+    private static String signatureKey(Method m) {
+        return signatureKey(m.getDefiningClass(), m.getName(),
+                m.getParameterTypes(), m.getReturnType());
+    }
+
+    private static String signatureKey(String definingClass, String name,
+                                       List<? extends CharSequence> params, String returnType) {
+        String[] arr;
+        if (params == null || params.isEmpty()) {
+            arr = new String[0];
+        } else {
+            arr = new String[params.size()];
+            for (int i = 0; i < params.size(); i++) {
+                arr[i] = params.get(i).toString();
             }
         }
-        return true;
+        return PackerMain.methodKey(definingClass, name, arr, returnType);
     }
 
     private static MethodImplementation buildTrampoline(Method m, int dexIndex, int methodIdx) {

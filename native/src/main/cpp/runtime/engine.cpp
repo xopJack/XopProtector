@@ -200,6 +200,15 @@ static void parse_config_json(const std::string& json_text) {
             }
         }
         protector::so::set_so_decrypt_mode(cfg.so_decrypt_mode);
+        cfg.so_diag = false;
+        if (j.contains("so_diag")) {
+            if (j["so_diag"].is_boolean()) {
+                cfg.so_diag = j["so_diag"].get<bool>();
+            } else if (j["so_diag"].is_number_integer()) {
+                cfg.so_diag = j["so_diag"].get<int>() != 0;
+            }
+        }
+        protector::so::set_so_diag(cfg.so_diag);
         cfg.vmp_lru = 32;
         if (j.contains("vmp_lru") && j["vmp_lru"].is_number_integer()) {
             int n = j["vmp_lru"].get<int>();
@@ -233,7 +242,7 @@ static void parse_config_json(const std::string& json_text) {
             }
         }
         protector::report::set_report_enabled(report_enabled);
-        PLOGI("config app=%s xor=0x%x aes=%s dex_aes=%s assets_aes=%s risk_flags=0x%x rasp=%d report=%d protect_so=%d so_decrypt=%s encrypt_assets=%d vmp_lru=%d sign=%s",
+        PLOGI("config app=%s xor=0x%x aes=%s dex_aes=%s assets_aes=%s risk_flags=0x%x rasp=%d report=%d protect_so=%d so_decrypt=%s so_diag=%d encrypt_assets=%d vmp_lru=%d sign=%s",
               cfg.application_name.c_str(), cfg.insns_xor_key,
               cfg.insns_aes_key.size() == 16 ? "yes" : "no",
               cfg.dex_aes_key.size() == 16 ? "yes" : "no",
@@ -243,6 +252,7 @@ static void parse_config_json(const std::string& json_text) {
               report_enabled ? 1 : 0,
               cfg.protect_so ? 1 : 0,
               cfg.so_decrypt_mode == SoDecryptMode::Lazy ? "lazy" : "eager",
+              cfg.so_diag ? 1 : 0,
               cfg.encrypt_assets ? 1 : 0,
               cfg.vmp_lru,
               cfg.app_sign_sha256.empty() ? "(none)" : "set");
@@ -775,6 +785,7 @@ PROTECTOR_ENCRYPT void init_app(JNIEnv* env, jclass, jstring protector_dir_j,
     protector::report::set_report_dir(dir);
     // Keep existing nativeLibraryDir if Java already called setNativeLibraryDir.
     protector::so::set_runtime_dirs(dir, "");
+    protector::so::load_so_text_diag(dir);
 
     const bool warm = has_warm_dex_cache(dir);
     if (!file_exists(code_path)) {
@@ -1027,7 +1038,7 @@ jstring read_application_name(JNIEnv* env, jclass) {
 }
 
 jstring native_version(JNIEnv* env, jclass) {
-    return env->NewStringUTF("protector-native/0.6.30");
+    return env->NewStringUTF("protector-native/0.7.1");
 }
 
 jboolean environment_degraded(JNIEnv*, jclass) {

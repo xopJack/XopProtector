@@ -98,6 +98,11 @@ struct ShellConfig {
      */
     SoDecryptMode so_decrypt_mode = SoDecryptMode::Eager;
     /**
+     * From config.json {@code so_diag}; missing → false.
+     * Enables [XOP-SO] load/materialize diagnostics in Release.
+     */
+    bool so_diag = false;
+    /**
      * Max decrypted TRUE_VMP images kept in memory (config.json {@code vmp_lru}).
      * Default 32. Missing field → 32.
      */

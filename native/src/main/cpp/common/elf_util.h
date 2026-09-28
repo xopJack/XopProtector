@@ -2,6 +2,7 @@
 
 #include <elf.h>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace protector {
@@ -41,5 +42,15 @@ bool get_first_pt_load_vaddr(const char* elf_path, uint64_t* out_vaddr);
  * and returns true. On failure returns false and leaves *out_bias unchanged.
  */
 bool find_so_load_bias(const char* so_name, uintptr_t* out_bias);
+
+/**
+ * One /proc/self/maps record. 4KB chunks are stitched until newline so a
+ * pathname longer than 255 bytes is not split onto the next parse.
+ * The stored line is capped at PATH_MAX plus the maps prefix.
+ */
+bool read_maps_record(FILE* fp, std::string* line);
+
+/** Pathname after the inode field, including spaces. False if anonymous. */
+bool maps_pathname(const std::string& line, std::string* path);
 
 } // namespace protector

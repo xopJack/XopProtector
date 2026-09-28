@@ -25,18 +25,25 @@ void set_so_decrypt_mode(protector::SoDecryptMode mode);
 protector::SoDecryptMode so_decrypt_mode();
 
 /**
- * Eager: copy each keyed SO into protectorDir/so_plain and decrypt.
- * Lazy: mkdir only on cold start; dlopen path decrypts keyed DT_NEEDED closure.
- * Both modes reuse {@code so_plain/} + {@code so_plain_ready} across launches
- * (plaintext warm). APK stamp invalidation clears the cache on update.
+ * From config.json {@code so_diag} or {@code debug.protector.so_diag=1}.
+ * When enabled, emits [XOP-SO] materialize/dlopen status even in Release builds.
+ * Debug (!NDEBUG) builds always enable diagnostics.
+ */
+void set_so_diag(bool on);
+
+/** True when [XOP-SO] diagnostics should be emitted. */
+bool so_diag_enabled();
+
+/**
+ * Mkdir so_plain only. Does not RC4/hash/pin the keyed set at Application attach.
+ * Extract-inode hooks map keyed SOs from packaged extract and RC4 .text in RAM.
+ * Falls back to a full table if those hooks failed.
  */
 void materialize_decrypted_sos();
 
 /**
- * Eager: preload all keyed so_plain modules (DT_NEEDED order) so linker
- * internal resolves never hit packaged ciphertext.
- * Lazy: only preload mirrors already present in so_plain this process; then
- * schedule background fill of remaining keyed SOs (writes so_plain_ready).
+ * Skip full keyed pin when dlopen/linker hooks work; schedule background fill
+ * of remaining so_plain mirrors (writes so_plain_ready for the next launch).
  * Idempotent per process. Call after NativeLibDirRedirect (so_plain fallback).
  */
 void preload_so_plain();
@@ -46,6 +53,13 @@ void install_business_so_hooks();
 
 /** True if any business SO keys were loaded. */
 bool has_sokeys();
+
+/**
+ * Load assets/protector {@code so_text_diag.json} from the code-cache protector dir
+ * (copied by ProxyApplication). Missing file is OK (older packs). Used to gate
+ * materialize / warm reuse / dlopen on .text offset/size/sha256 mismatch.
+ */
+void load_so_text_diag(const std::string& protector_dir);
 
 /**
  * Optional AES-128 key for legacy so_warm/ PSW1 (unused when plaintext warm is on).
