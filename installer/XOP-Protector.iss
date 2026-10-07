@@ -5,7 +5,7 @@
 ; Requires: dist\XopProtector\ from scripts\release-desktop.ps1
 
 #define MyAppName "XopProtector"
-#define MyAppVersion "0.7.1"
+#define MyAppVersion "0.7.2"
 #define MyAppPublisher "XOP"
 #define MyAppExeName "XopProtector.exe"
 #define MyAppId "{{A7C3E91B-4D2F-4E8A-9B1C-6F0D8E2A5B74}"

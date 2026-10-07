@@ -26,11 +26,11 @@
 
     <Description>XopProtector — local Android APK protection</Description>
 
-    <Version>0.7.1</Version>
+    <Version>0.7.2</Version>
 
-    <FileVersion>0.7.1.0</FileVersion>
+    <FileVersion>0.7.2.0</FileVersion>
 
-    <InformationalVersion>0.7.1</InformationalVersion>
+    <InformationalVersion>0.7.2</InformationalVersion>
 
   </PropertyGroup>
 

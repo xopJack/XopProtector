@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.7.2
+
+- Desktop / installer / packer jar / native version **0.7.2**.
+
 ## 0.7.1
 
 - SO protect runtime: Application attach no longer RC4/pins the full keyed table.
