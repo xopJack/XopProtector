@@ -121,6 +121,12 @@ public final class DexMerger {
             if (zip.isFile() && zip.delete()) {
                 Log.i(TAG, "deleted plaintext dexes.zip after merge");
             }
+            // After ClassLoader sees business DEX: enable DexFile(APK) class-name scan compat.
+            try {
+                DexScanCompat.install(protectorDir);
+            } catch (Throwable t) {
+                Log.w(TAG, "DexScanCompat skipped", t);
+            }
         } catch (Throwable t) {
             Log.e(TAG, "merge failed", t);
         }
@@ -134,7 +140,8 @@ public final class DexMerger {
         }
     }
 
-    private static List<File> listExistingDexes(File outDir) {
+    /** Package-visible for {@link DexScanCompat} (same early-CL constraints). */
+    static List<File> listExistingDexes(File outDir) {
         // No lambdas/method-refs: shell runs before full multidex on API 23; R8
         // ExternalSyntheticLambda* may be missing from the early ClassLoader path.
         File[] files = outDir.listFiles(new java.io.FilenameFilter() {

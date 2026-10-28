@@ -50,6 +50,7 @@ add_library(protector SHARED
         codeitem/multi_dex_code.cpp
         dex/dex_file.cpp
         hook/hooks.cpp
+        hook/dex_scan_compat.cpp
         runtime/engine.cpp
         jni/jni_bridge.cpp
         risk/risk.cpp

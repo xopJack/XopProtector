@@ -212,12 +212,18 @@ void init_protector() {
 #endif
     runtime_state().sdk_level = android_get_device_api_level();
     // Install after JNI_OnLoad — never from .init_array (linker-hook + bh_cfi
-    // dlopen deadlock on some OEMs). Dobby linker hooks stay here; ART class
-    // hooks remain deferred to init_app.
+    // dlopen deadlock on some OEMs). ART class hooks remain deferred to init_app.
+    //
+    // Do NOT install business SO dlopen/openat hooks here. bytehook_hook_all on
+    // dlopen makes the linker attribute subsequent loads (e.g. vendor
+    // mapper.*.so for HWUI) to libprotector.so's app namespace (clns-*),
+    // which cannot open /vendor/lib64/hw/* and aborts RenderThread /
+    // GraphicBufferAllocator on OEM Android 12+ (MTK / Xiaomi / …).
+    // Install those hooks only after sokeys are loaded (see engine.cpp) when
+    // --protect-so actually needs them.
     protector::hook::ensure_bytehook();
-    protector::so::install_business_so_hooks();
     protector::risk::risk_checker().start();
-    PLOGI("init_protector done (hooks from JNI_OnLoad; ART hooks deferred)");
+    PLOGI("init_protector done (bytehook ready; SO dlopen hooks deferred)");
 }
 
 } // namespace protector

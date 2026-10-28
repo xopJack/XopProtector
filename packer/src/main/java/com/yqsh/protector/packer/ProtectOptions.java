@@ -138,6 +138,12 @@ public final class ProtectOptions {
     public boolean encryptAssets;
 
     /**
+     * DexFile(sourceDir) class-name scan compat (XPage / ARouter-style).
+     * Default <strong>on</strong>. CLI: {@code --no-dex-scan-compat}.
+     */
+    public boolean dexScanCompat = true;
+
+    /**
      * Phase 3 — proxy/VPN detect + optional cert pin list.
      * CLI: {@code --detect-proxy} / {@code --pin-certs <file>}.
      * Desktop UI currently hidden; use packer CLI to enable.

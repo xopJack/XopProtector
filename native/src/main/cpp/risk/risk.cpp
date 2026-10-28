@@ -341,20 +341,79 @@ static void detect_ptrace_self() {
     (void)0;
 }
 
-/** Check /proc/self/stat for 't' / 'T' state (traced / stopped). */
-static void detect_stat_trace() {
+/**
+ * State character from /proc/self/stat.
+ * comm is "(name)" and may contain spaces, so scan to the last ')' —
+ * fields after comm are numeric and do not contain ')'.
+ * Returns 0 when the file cannot be read.
+ */
+static char read_self_stat_state() {
     FILE* fp = fopen("/proc/self/stat", "r");
-    if (!fp) return;
-    char state = 0;
-    // Format: pid (comm) state ppid ...
-    if (fscanf(fp, "%*d %*s %c", &state) == 1) {
-        if (state == 't' || state == 'T') {
-            PLOGD("process state='%c' — traced/stopped", state);
-            fclose(fp);
-            CRASH_SEGV("stat_traced");
+    if (!fp) return 0;
+    char buf[512];
+    if (fgets(buf, sizeof(buf), fp) == nullptr) {
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+    char* end = strrchr(buf, ')');
+    if (end == nullptr || end[1] == '\0') return 0;
+    char* p = end + 1;
+    while (*p == ' ') ++p;
+    return *p;
+}
+
+/** Real uid of pid from /proc/pid/status. False when unreadable. */
+static bool read_proc_uid(int pid, int* uid_out) {
+    if (pid <= 0 || uid_out == nullptr) return false;
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", pid);
+    FILE* fp = fopen(path, "r");
+    if (!fp) return false;
+    char line[256];
+    bool ok = false;
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        if (strncmp(line, "Uid:", 4) == 0) {
+            int uid = -1;
+            if (sscanf(line + 4, "%d", &uid) == 1 && uid >= 0) {
+                *uid_out = uid;
+                ok = true;
+            }
+            break;
         }
     }
     fclose(fp);
+    return ok;
+}
+
+/**
+ * OEM security scanners (any vendor) attach briefly as a system uid.
+ * AID_SHELL (2000) is adb/gdb and stays hostile.
+ */
+static bool is_system_tracer(int pid) {
+    int uid = -1;
+    if (!read_proc_uid(pid, &uid)) return false;
+    if (uid == 2000) return false;
+    return uid < 10000;
+}
+
+/** TracerPid that is not self or parent. 0 when absent or ignored. */
+static int read_foreign_tracer_pid() {
+    FILE* fp = fopen("/proc/self/status", "r");
+    if (!fp) return 0;
+    int tracer_pid = 0;
+    char line[256];
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            sscanf(line + 10, "%d", &tracer_pid);
+            break;
+        }
+    }
+    fclose(fp);
+    if (tracer_pid == 0 || tracer_pid == getpid() || tracer_pid == getppid()) {
+        return 0;
+    }
+    return tracer_pid;
 }
 
 /** Timing anomaly: a debugger single-stepping causes large delays in
@@ -609,29 +668,49 @@ bool vmp_allowed() {
 
 static void detect_debugger() {
     // Multi-source: TracerPid, stat, ptrace self-attach, timing.
-    FILE* fp = fopen("/proc/self/status", "r");
-    if (fp) {
-        char line[256];
-        while (fgets(line, sizeof(line), fp) != nullptr) {
-            if (strncmp(line, "TracerPid:", 10) == 0) {
-                int tracer_pid = 0;
-                sscanf(line + 10, "%d", &tracer_pid);
-                // After PTRACE_TRACEME the tracer is typically our parent
-                // (see ptrace(2)), not ourselves. Ignore parent as well so
-                // the periodic risk loop does not false-positive.
-                if (tracer_pid != 0
-                    && tracer_pid != getpid()
-                    && tracer_pid != getppid()) {
-                    PLOGD("tracer pid=%d", tracer_pid);
-                    fclose(fp);
-                    CRASH_SEGV("tracer_pid");
-                }
-                break;
-            }
-        }
-        fclose(fp);
+    // System-uid tracers (phone security scan on any OEM) are ignored.
+    // A non-system attach must still be present on the next loop (~2–5 s)
+    // before we crash, so a one-shot scan does not kill the process.
+    int tracer_pid = read_foreign_tracer_pid();
+    bool system_tracer = tracer_pid > 0 && is_system_tracer(tracer_pid);
+    if (system_tracer) {
+        PLOGD("ignore system tracer pid=%d", tracer_pid);
+        tracer_pid = 0;
     }
-    detect_stat_trace();
+
+    char state = read_self_stat_state();
+    bool stat_traced = (state == 't' || state == 'T');
+    // 't' from a system scanner is the same short attach — not a debugger.
+    if (system_tracer) stat_traced = false;
+
+    const char* reason = nullptr;
+    int hit_key = 0;
+    if (tracer_pid > 0) {
+        reason = "tracer_pid";
+        hit_key = tracer_pid;
+    } else if (stat_traced) {
+        reason = "stat_traced";
+        hit_key = -1;
+    }
+
+    static int s_streak = 0;
+    static int s_last_key = 0;
+    if (reason == nullptr) {
+        s_streak = 0;
+        s_last_key = 0;
+    } else if (hit_key == s_last_key) {
+        s_streak++;
+    } else {
+        s_streak = 1;
+        s_last_key = hit_key;
+    }
+
+    if (reason != nullptr && s_streak >= 2) {
+        PLOGD("debugger persist reason=%s tracer=%d state='%c' streak=%d",
+              reason, tracer_pid, state != 0 ? state : '?', s_streak);
+        CRASH_SEGV(reason);
+    }
+
     detect_ptrace_self();
     detect_timing_anomaly();
 }

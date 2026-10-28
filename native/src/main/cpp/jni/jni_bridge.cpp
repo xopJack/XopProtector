@@ -2,6 +2,7 @@
 #include "common/log.h"
 #include "common/protector_macro.h"
 #include "dex/dex_file.h"
+#include "hook/dex_scan_compat.h"
 #include "risk/risk.h"
 #include "runtime/engine.h"
 #include "so/business_so.h"
@@ -73,6 +74,13 @@ static void native_finish_business_so(JNIEnv*, jclass) {
     protector::so::decrypt_already_loaded_async();
 }
 
+static void native_install_business_so_hooks(JNIEnv*, jclass) {
+    if (!protector::so::has_sokeys()) {
+        return;
+    }
+    protector::so::install_business_so_hooks();
+}
+
 static void native_report_threat(JNIEnv* env, jclass, jstring reason) {
     // Soft path for Java NetGuard: always record; may mark degraded; never
     // Block-crash here (proxy/VPN false positives must not kill the process).
@@ -99,6 +107,19 @@ static void native_prepatch_extracted(JNIEnv* env, jclass, jstring dir) {
     env->ReleaseStringUTFChars(dir, utf);
 }
 
+static jboolean native_dex_scan_compat_enabled(JNIEnv*, jclass) {
+    return protector::hook::dex_scan_compat_enabled() ? JNI_TRUE : JNI_FALSE;
+}
+
+static jboolean native_install_dex_scan_compat(JNIEnv* env, jclass, jstring facade) {
+    if (facade == nullptr) return JNI_FALSE;
+    const char* utf = env->GetStringUTFChars(facade, nullptr);
+    if (utf == nullptr) return JNI_FALSE;
+    bool ok = protector::hook::install_dex_scan_compat(env, utf);
+    env->ReleaseStringUTFChars(facade, utf);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
 static JNINativeMethod g_methods[] = {
         {"initApp", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
          (void*)protector::runtime::init_app},
@@ -120,10 +141,16 @@ static JNINativeMethod g_methods[] = {
          (void*)native_ensure_business_so},
         {"finishBusinessSoDecrypt", "()V",
          (void*)native_finish_business_so},
+        {"installBusinessSoHooks", "()V",
+         (void*)native_install_business_so_hooks},
         {"decryptAssetBlob", "([B)[B",
          (void*)protector::assets::decrypt_asset_blob_jni},
         {"reportThreat", "(Ljava/lang/String;)V",
          (void*)native_report_threat},
+        {"dexScanCompatEnabled", "()Z",
+         (void*)native_dex_scan_compat_enabled},
+        {"installDexScanCompat", "(Ljava/lang/String;)Z",
+         (void*)native_install_dex_scan_compat},
 };
 
 static JNINativeMethod g_vm_methods[] = {

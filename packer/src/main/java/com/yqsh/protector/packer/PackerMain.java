@@ -99,6 +99,8 @@ public class PackerMain {
     private boolean protectSo = true;
     /** Phase 2A: encrypt assets/** into protector/aenc (default off). */
     private boolean encryptAssets = false;
+    /** DexFile(sourceDir) scan compat — default on. */
+    private boolean dexScanCompat = true;
     /** Phase 2B: shorten res/ paths + rewrite resources.arsc (default off). */
     private boolean enableResProtect = false;
     /** Phase 3: proxy/VPN heuristics (default off). */
@@ -152,6 +154,7 @@ public class PackerMain {
         industryAutoVmpFromCli = autoVmp.industryFromCli;
         protectSo = options.protectSo;
         encryptAssets = options.encryptAssets;
+        dexScanCompat = options.dexScanCompat;
         enableResProtect = options.enableResProtect;
         detectProxy = options.detectProxy || options.enableNetGuard;
         pinCertSha256.clear();
@@ -320,6 +323,7 @@ public class PackerMain {
                 + "[--auto-true-vmp payment|industry|both|off] "
                 + "[--protect-so|--no-protect-so] "
                 + "[--encrypt-assets|--no-encrypt-assets] "
+                + "[--dex-scan-compat|--no-dex-scan-compat] "
                 + "[--enable-res-protect|--no-res-protect] "
                 + "[--detect-proxy] [--pin-certs <file>] "
                 + "[--channel <name>] [--channels <file>] "
@@ -356,6 +360,8 @@ public class PackerMain {
         System.err.println("  --encrypt-assets   AES-GCM encrypt assets/** → protector/aenc (default OFF)");
         System.err.println("                     App must use ProtectorAssets (no AssetManager hook)");
         System.err.println("  --no-encrypt-assets disable assets encryption");
+        System.err.println("  --dex-scan-compat  DexFile(APK) class-scan compat (default ON)");
+        System.err.println("  --no-dex-scan-compat disable DexFile scan compat");
         System.err.println("  --enable-res-protect shorten res/ paths + rewrite resources.arsc (default OFF)");
         System.err.println("  --no-res-protect   disable res path obfuscation");
         System.err.println("  --detect-proxy     enable proxy/VPN heuristics (NetGuard; default OFF)");
@@ -399,6 +405,7 @@ public class PackerMain {
         boolean protectSo = true;
         boolean encryptAssetsFlag = false;
         boolean enableResProtectFlag = false;
+        boolean dexScanCompatFlag = true;
         boolean detectProxyFlag = false;
         List<String> pinCerts = new ArrayList<>();
         String channelFlag = null;
@@ -455,6 +462,10 @@ public class PackerMain {
                 encryptAssetsFlag = true;
             } else if ("--no-encrypt-assets".equals(args[i])) {
                 encryptAssetsFlag = false;
+            } else if ("--dex-scan-compat".equals(args[i])) {
+                dexScanCompatFlag = true;
+            } else if ("--no-dex-scan-compat".equals(args[i])) {
+                dexScanCompatFlag = false;
             } else if ("--enable-res-protect".equals(args[i]) || "--res-protect".equals(args[i])) {
                 enableResProtectFlag = true;
             } else if ("--no-res-protect".equals(args[i])) {
@@ -547,6 +558,7 @@ public class PackerMain {
         options.industryAutoVmp = industryAutoVmp;
         options.protectSo = protectSo;
         options.encryptAssets = encryptAssetsFlag;
+        options.dexScanCompat = dexScanCompatFlag;
         options.enableResProtect = enableResProtectFlag;
         options.detectProxy = detectProxyFlag;
         options.enableNetGuard = detectProxyFlag || !pinCerts.isEmpty();
@@ -800,8 +812,8 @@ public class PackerMain {
 
             // config.json — AES/HMAC keys are HKDF-derived at runtime, not stored here.
             // HMAC-SHA256 protects risk_flags / rasp_action / app_sign_sha256 / protect_so /
-            // encrypt_assets / net_guard / so_decrypt_mode / so_diag / package / vmp_lru /
-            // dex_hmac / code_hmac / code_methods_hmac / bitcode_hmac.
+            // encrypt_assets / dex_scan_compat / net_guard / so_decrypt_mode / so_diag /
+            // package / vmp_lru / dex_hmac / code_hmac / code_methods_hmac / bitcode_hmac.
             boolean netGuardOn = detectProxy || !pinCertSha256.isEmpty();
             if (netGuardOn) {
                 writeNetGuardJson(assetsProtector, detectProxy, pinCertSha256);
@@ -812,6 +824,7 @@ public class PackerMain {
                     "{\"application_name\":\"%s\",\"insns_xor_key\":%d,"
                             + "\"risk_flags\":%d,\"rasp_action\":%d,\"report_enabled\":%s,"
                             + "\"app_sign_sha256\":\"%s\",\"protect_so\":%s,\"encrypt_assets\":%s,"
+                            + "\"dex_scan_compat\":%s,"
                             + "\"detect_proxy\":%s,\"net_guard\":%s,\"so_decrypt_mode\":\"%s\","
                             + "\"so_diag\":%s,"
                             + "\"package\":\"%s\",\"vmp_lru\":%d,\"dex_hmac\":\"%s\","
@@ -820,6 +833,7 @@ public class PackerMain {
                     riskFlags, raspAction, reportEnabled ? "true" : "false", appSignSha256,
                     wroteSokeys ? "true" : "false",
                     (assetsEncrypted > 0) ? "true" : "false",
+                    dexScanCompat ? "true" : "false",
                     detectProxy ? "true" : "false",
                     netGuardOn ? "true" : "false",
                     soDecryptWire,
@@ -847,6 +861,7 @@ public class PackerMain {
                     + " code_methods_hmac=set"
                     + " bitcode_hmac=" + bitcodeHmac.size()
                     + " encrypt_assets=" + (assetsEncrypted > 0)
+                    + " dex_scan_compat=" + dexScanCompat
                     + " res_protect=" + enableResProtect
                     + " detect_proxy=" + detectProxy
                     + " pin_certs=" + pinCertSha256.size());

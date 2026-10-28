@@ -77,6 +77,13 @@ public final class JniBridge {
     public static native void finishBusinessSoDecrypt();
 
     /**
+     * Install business-SO dlopen/openat hooks. No-op without sokeys.
+     * Must run <strong>after</strong> the first HWUI frame so vendor mapper
+     * libs load under a normal namespace (not libprotector clns-*).
+     */
+    public static native void installBusinessSoHooks();
+
+    /**
      * Decrypt a PAS1 asset blob ({@code PAS1 || AES-GCM}). Prefer
      * {@link ProtectorAssets#open(android.content.Context, String)}.
      */
@@ -87,4 +94,18 @@ public final class JniBridge {
      * Honours {@code rasp_action}: Alert / Degrade / Block.
      */
     public static native void reportThreat(String reason);
+
+    /**
+     * From config.json {@code dex_scan_compat}. Missing field → {@code true}.
+     * Used by {@link DexScanCompat} before installing the DexFile redirect.
+     */
+    public static native boolean dexScanCompatEnabled();
+
+    /**
+     * Install DexFile(sourceDir) → scan facade redirect (fail-open inside native).
+     * {@code facadePath} is absolute path to {@code scan_facade.zip}.
+     *
+     * @return true when the native redirect hook was installed
+     */
+    public static native boolean installDexScanCompat(String facadePath);
 }

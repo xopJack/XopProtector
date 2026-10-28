@@ -48,6 +48,13 @@ void materialize_decrypted_sos();
  */
 void preload_so_plain();
 
+/**
+ * Install linker mmap / call_constructors / openat rewrite only (L2e decrypt).
+ * Safe after sokeys load — does not bytehook_hook_all libc dlopen
+ * (that poisons vendor HWUI mapper into clns-*).
+ */
+void install_business_so_extract_hooks_early();
+
 /** Install dlopen / android_dlopen_ext hooks to decrypt .text on first load. */
 void install_business_so_hooks();
 

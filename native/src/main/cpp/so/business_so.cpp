@@ -5861,6 +5861,16 @@ static int fake_dl_iterate_phdr(int (*cb)(struct dl_phdr_info*, size_t, void*),
     return BYTEHOOK_CALL_PREV(fake_dl_iterate_phdr, dl_iterate_rewrite_cb, &pkg);
 }
 
+void install_business_so_extract_hooks_early() {
+    if (!has_sokeys()) {
+        return;
+    }
+    install_linker_extract_hooks();
+    install_linker_open_hooks();
+    PLOGI("business so: early extract-inode / linker-open hooks "
+          "(dlopen bytehooks still deferred)");
+}
+
 void install_business_so_hooks() {
     bool expected = false;
     if (!g_hooks_installed.compare_exchange_strong(expected, true)) {

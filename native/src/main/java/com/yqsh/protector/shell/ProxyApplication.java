@@ -1,13 +1,16 @@
 package com.yqsh.protector.shell;
 
+import android.app.Activity;
 import android.app.Application;
 import android.content.ComponentCallbacks;
 import android.content.Context;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.Log;
+import android.view.Choreographer;
 
 import androidx.annotation.Keep;
 
@@ -18,6 +21,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -444,6 +448,7 @@ public class ProxyApplication extends Application {
         try {
             app.onCreate();
             Log.i(TAG, "real Application.onCreate called: " + app.getClass().getName());
+            DeferredSoHooksInstaller.schedule(app);
             return;
         } catch (Throwable t) {
             if (!isSophixProvidersAbandon(t)) {
@@ -462,6 +467,7 @@ public class ProxyApplication extends Application {
             realApplication = business;
             business.onCreate();
             Log.i(TAG, "business Application.onCreate called: " + business.getClass().getName());
+            DeferredSoHooksInstaller.schedule(business);
         } catch (Throwable t) {
             Log.e(TAG, "business Application.onCreate failed", t);
         }
@@ -562,6 +568,9 @@ public class ProxyApplication extends Application {
         // rewrite when classes*.dex already exists with non-zero length.
         deleteExtractedDexes(outDir);
         deleteQuietly(new File(outDir, ".prepatched"));
+        deleteQuietly(new File(outDir, DexScanCompat.FACADE_ZIP));
+        deleteQuietly(new File(outDir, "scan_facade.stamp"));
+        deleteQuietly(new File(outDir, DexScanCompat.FACADE_ZIP + ".tmp"));
         deleteQuietly(new File(new File(outDir, "so_plain"), "so_plain_ready"));
         deleteQuietly(new File(outDir, "dex_bundle.zip")); // legacy from brief experiment
         deleteDir(new File(outDir, "so_plain"));
@@ -641,5 +650,109 @@ public class ProxyApplication extends Application {
 
     private static String safe(String s) {
         return s == null ? "" : s.trim();
+    }
+
+    /**
+     * Installs business-SO dlopen hooks only after the first Activity frame.
+     * Installing earlier (JNI_OnLoad / init_app) makes vendor HWUI mapper loads
+     * attribute to libprotector's clns-* namespace → GraphicBufferAllocator
+     * failure / black screen on OEM Android 12+ (see MTK linker patch).
+     * <p>No lambdas / anonymous classes — early ClassLoader / R8 synthetics.
+     */
+    @Keep
+    static final class DeferredSoHooksInstaller
+            implements Application.ActivityLifecycleCallbacks, Choreographer.FrameCallback {
+        private static final AtomicBoolean sScheduled = new AtomicBoolean(false);
+        private static final AtomicBoolean sInstalled = new AtomicBoolean(false);
+        private final Application host;
+        private int phase;
+
+        DeferredSoHooksInstaller(Application host) {
+            this.host = host;
+        }
+
+        static void schedule(Application real) {
+            if (real == null || !sScheduled.compareAndSet(false, true)) {
+                return;
+            }
+            DeferredSoHooksInstaller cb = new DeferredSoHooksInstaller(real);
+            try {
+                real.registerActivityLifecycleCallbacks(cb);
+                Log.i(TAG, "deferred SO dlopen hooks: wait first Activity resume");
+            } catch (Throwable t) {
+                Log.w(TAG, "register deferred SO hooks failed; install now", t);
+                installNow();
+            }
+        }
+
+        private static void installNow() {
+            if (!sInstalled.compareAndSet(false, true)) {
+                return;
+            }
+            try {
+                JniBridge.installBusinessSoHooks();
+                Log.i(TAG, "deferred SO dlopen hooks installed");
+            } catch (Throwable t) {
+                Log.w(TAG, "installBusinessSoHooks failed", t);
+            }
+        }
+
+        @Override
+        public void onActivityResumed(Activity activity) {
+            if (phase != 0) {
+                return;
+            }
+            phase = 1;
+            try {
+                host.unregisterActivityLifecycleCallbacks(this);
+            } catch (Throwable ignored) {
+            }
+            try {
+                Choreographer.getInstance().postFrameCallback(this);
+            } catch (Throwable t) {
+                installNow();
+            }
+        }
+
+        @Override
+        public void doFrame(long frameTimeNanos) {
+            // First callback may run during the first draw; wait one more frame
+            // so vendor mapper / GraphicBuffer path has finished under a clean ns.
+            if (phase == 1) {
+                phase = 2;
+                try {
+                    Choreographer.getInstance().postFrameCallback(this);
+                    return;
+                } catch (Throwable t) {
+                    installNow();
+                    return;
+                }
+            }
+            installNow();
+        }
+
+        @Override
+        public void onActivityCreated(Activity activity, Bundle savedInstanceState) {
+        }
+
+        @Override
+        public void onActivityStarted(Activity activity) {
+        }
+
+        @Override
+        public void onActivityPaused(Activity activity) {
+        }
+
+        @Override
+        public void onActivityStopped(Activity activity) {
+        }
+
+        @Override
+        public void onActivitySaveInstanceState(Activity activity, Bundle outState) {
+        }
+
+        @Override
+        public void onActivityDestroyed(Activity activity) {
+        }
     }
 }

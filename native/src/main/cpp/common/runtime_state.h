@@ -93,6 +93,11 @@ struct ShellConfig {
     /** Packer encrypted business assets (--encrypt-assets). */
     bool encrypt_assets = false;
     /**
+     * Redirect DexFile(sourceDir) scans to decrypted business DEX facade.
+     * Default true when field missing (compat for XPage / DexFile class scanners).
+     */
+    bool dex_scan_compat = true;
+    /**
      * From config.json {@code so_decrypt_mode}; missing field → Eager.
      * Lazy skips full cold-start materialize (on-demand keyed DT_NEEDED closure).
      */

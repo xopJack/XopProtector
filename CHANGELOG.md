@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.4
+
+- Defer business-SO `bytehook` dlopen hooks until after the first UI frames;
+  install linker extract-inode / open hooks early when sokeys exist. Avoids
+  vendor HWUI / GPU libs loading into `libprotector` `clns-*` (Adreno
+  `libadreno_utils` / `GraphicBufferMapper`, MTK mapper /
+  `GraphicBufferAllocator`) → black screen / 0 frames on OEM Android 10+.
+- Desktop / installer / packer jar / native version **0.7.4**.
+
 ## 0.7.3
 
 - Desktop / installer / packer jar / native version **0.7.3**.

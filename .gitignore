@@ -3,6 +3,7 @@
 .gradle-tmp-home/
 **/build/
 .idea/
+local.properties
 *.iws
 *.ipr
 .tmp-android-sdk/

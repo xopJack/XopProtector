@@ -185,6 +185,15 @@ static void parse_config_json(const std::string& json_text) {
                 cfg.encrypt_assets = j["encrypt_assets"].get<int>() != 0;
             }
         }
+        // Missing dex_scan_compat → true (DexFile APK scan compat for XPage etc.).
+        cfg.dex_scan_compat = true;
+        if (j.contains("dex_scan_compat")) {
+            if (j["dex_scan_compat"].is_boolean()) {
+                cfg.dex_scan_compat = j["dex_scan_compat"].get<bool>();
+            } else if (j["dex_scan_compat"].is_number_integer()) {
+                cfg.dex_scan_compat = j["dex_scan_compat"].get<int>() != 0;
+            }
+        }
         // Missing so_decrypt_mode → Eager (old APKs / unsigned configs).
         cfg.so_decrypt_mode = SoDecryptMode::Eager;
         if (j.contains("so_decrypt_mode") && j["so_decrypt_mode"].is_string()) {
@@ -243,7 +252,7 @@ static void parse_config_json(const std::string& json_text) {
             }
         }
         protector::report::set_report_enabled(report_enabled);
-        PLOGI("config app=%s xor=0x%x aes=%s dex_aes=%s assets_aes=%s risk_flags=0x%x rasp=%d report=%d protect_so=%d so_decrypt=%s so_diag=%d encrypt_assets=%d vmp_lru=%d sign=%s",
+        PLOGI("config app=%s xor=0x%x aes=%s dex_aes=%s assets_aes=%s risk_flags=0x%x rasp=%d report=%d protect_so=%d so_decrypt=%s so_diag=%d encrypt_assets=%d dex_scan_compat=%d vmp_lru=%d sign=%s",
               cfg.application_name.c_str(), cfg.insns_xor_key,
               cfg.insns_aes_key.size() == 16 ? "yes" : "no",
               cfg.dex_aes_key.size() == 16 ? "yes" : "no",
@@ -255,6 +264,7 @@ static void parse_config_json(const std::string& json_text) {
               cfg.so_decrypt_mode == SoDecryptMode::Lazy ? "lazy" : "eager",
               cfg.so_diag ? 1 : 0,
               cfg.encrypt_assets ? 1 : 0,
+              cfg.dex_scan_compat ? 1 : 0,
               cfg.vmp_lru,
               cfg.app_sign_sha256.empty() ? "(none)" : "set");
         // Keep K_hmac for dex/code/bitcode HMAC checks (not a single checkIntegrity).
@@ -964,7 +974,19 @@ PROTECTOR_ENCRYPT void init_app(JNIEnv* env, jclass, jstring protector_dir_j,
 
     // Install ART hooks before parsing/applying code.bin so DefineClass can patch.
     protector::hook::install_hooks();
-    protector::so::install_business_so_hooks();
+    // Split SO hooks:
+    // 1) Early: linker mmap / call_constructors / openat (L2e) — needed before
+    //    Application loads keyed SOs; Dobby on linker, not bytehook_hook_all.
+    // 2) Late: bytehook_hook_all(dlopen/…) after first UI frame — those rewrite
+    //    PLT caller identity and break vendor HWUI mapper into clns-*
+    //    (GraphicBufferAllocator / black screen on OEM Android 12+).
+    // See ProxyApplication.DeferredSoHooksInstaller for (2).
+    if (protector::so::has_sokeys()) {
+        protector::so::install_business_so_extract_hooks_early();
+        PLOGI("defer business SO dlopen bytehooks until first UI frame");
+    } else {
+        PLOGI("skip business SO hooks (no sokeys / --no-protect-so)");
+    }
     // decrypt_already_loaded_async is deferred until after DexMerger (Java calls
     // finishBusinessSoDecrypt) so we do not race ART while mapping dexes.
     std::string code_data = read_file(code_path);
@@ -1041,7 +1063,7 @@ jstring read_application_name(JNIEnv* env, jclass) {
 }
 
 jstring native_version(JNIEnv* env, jclass) {
-    return env->NewStringUTF("protector-native/0.7.3");
+    return env->NewStringUTF("protector-native/0.7.4");
 }
 
 jboolean environment_degraded(JNIEnv*, jclass) {
