@@ -61,9 +61,12 @@ public static class ReportBuilder
         if (!string.IsNullOrWhiteSpace(job.SizeReport) && File.Exists(job.SizeReport))
             return job.SizeReport;
         if (string.IsNullOrWhiteSpace(job.OutputPath)) return null;
-        var beside = Path.Combine(
-            Path.GetDirectoryName(job.OutputPath) ?? "",
-            Path.GetFileNameWithoutExtension(job.OutputPath) + "-size_report.json");
+        var outDir = Path.GetDirectoryName(job.OutputPath) ?? "";
+        var baseName = Path.GetFileNameWithoutExtension(job.OutputPath) + "-size_report.json";
+        var inLog = Path.Combine(outDir, "Log", baseName);
+        if (File.Exists(inLog)) return inLog;
+        // Legacy: report written beside the APK before Log/ layout.
+        var beside = Path.Combine(outDir, baseName);
         return File.Exists(beside) ? beside : job.SizeReport;
     }
 

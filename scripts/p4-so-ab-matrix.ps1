@@ -196,8 +196,11 @@ foreach ($v in $variants) {
         continue
     }
 
-    $diagBeside = $outApk -replace '\.apk$', '-so_text_diag.json'
-    $sizeBeside = $outApk -replace '\.apk$', '-size_report.json'
+    $outDir = Split-Path -Parent $outApk
+    $outBase = [IO.Path]::GetFileNameWithoutExtension($outApk)
+    $logDir = Join-Path $outDir "Log"
+    $diagBeside = Join-Path $logDir ($outBase + "-so_text_diag.json")
+    $sizeBeside = Join-Path $logDir ($outBase + "-size_report.json")
     $packHits = @(Get-XopPackHits -LogPath $packLog -SoName $WatchSo)
     $decision = if ($packHits.Count -gt 0) { $packHits[-1] } else { ("no XOP-PACK line for " + $WatchSo) }
     $diagSum = Summarize-DiagJson -DiagPath $diagBeside -SoName $WatchSo

@@ -12,7 +12,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Protected APK: executable\unimp-demo-protected.apk
-echo size_report:   executable\unimp-demo-protected-size_report.json
+echo size_report:   executable\Log\unimp-demo-protected-size_report.json
 echo.
 echo Install (prefer pm; adb install-incremental may fail):
 echo   adb push executable\unimp-demo-protected.apk /data/local/tmp/unimp.apk

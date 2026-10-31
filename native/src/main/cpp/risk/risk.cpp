@@ -804,8 +804,11 @@ static void verify_libc_text_crc() {
     PLOGD("libc .text crc file=%08x mem=%08x size=%u", crc_file, crc_mem,
           static_cast<unsigned>(shdr.sh_size));
     if (crc_file != crc_mem) {
-        PLOGW("libc .text crc mismatch file=%08x mem=%08x", crc_file, crc_mem);
-        CRASH_ILL("libc_crc");
+        // OEM (HyperOS/ColorOS/…) often remap or patch libc .text; file≠mem is
+        // a weak signal alone. Do not Block — rely on libc_export_hooked /
+        // Frida composite. Log for telemetry when CRC detect is explicitly on.
+        PLOGW("libc .text crc mismatch file=%08x mem=%08x (fail-open, no crash)",
+              crc_file, crc_mem);
     }
 }
 

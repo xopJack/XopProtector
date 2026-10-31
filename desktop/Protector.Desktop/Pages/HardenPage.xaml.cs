@@ -765,10 +765,16 @@ public partial class HardenPage : UserControl
         var sizeReport = _lastSizeReport;
         if (string.IsNullOrWhiteSpace(sizeReport) || !System.IO.File.Exists(sizeReport))
         {
-            var beside = IOPath.Combine(
-                IOPath.GetDirectoryName(job.OutputApk) ?? "",
-                IOPath.GetFileNameWithoutExtension(job.OutputApk) + "-size_report.json");
-            if (System.IO.File.Exists(beside)) sizeReport = beside;
+            var outDir = IOPath.GetDirectoryName(job.OutputApk) ?? "";
+            var baseName = IOPath.GetFileNameWithoutExtension(job.OutputApk) + "-size_report.json";
+            var inLog = IOPath.Combine(outDir, "Log", baseName);
+            if (System.IO.File.Exists(inLog)) sizeReport = inLog;
+            else
+            {
+                // Legacy: report written beside the APK before Log/ layout.
+                var beside = IOPath.Combine(outDir, baseName);
+                if (System.IO.File.Exists(beside)) sizeReport = beside;
+            }
         }
 
         var jobId = HistoryStore.NewId();
@@ -1157,7 +1163,7 @@ public partial class HardenPage : UserControl
 
             if (!string.IsNullOrEmpty(mirror) && !string.IsNullOrWhiteSpace(outputApk))
             {
-                // Refresh mirror so the beside-APK copy includes the final lines.
+                // Refresh mirror so the Log/ copy includes the final lines.
                 mirror = _logWriter.MirrorBesideOutput(outputApk!) ?? mirror;
                 _lastProtectLog = mirror;
                 LogPathHint.Text = mirror;

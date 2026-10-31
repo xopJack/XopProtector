@@ -5,7 +5,7 @@ namespace Protector.Desktop;
 
 /// <summary>
 /// Writes protect job console logs under %AppData%\XopProtector\logs\
-/// and optionally mirrors next to the output APK.
+/// and optionally mirrors under {@code <outputDir>/Log/}.
 /// </summary>
 public sealed class ProtectLogWriter : IDisposable
 {
@@ -41,7 +41,7 @@ public sealed class ProtectLogWriter : IDisposable
         }
     }
 
-    /// <summary>Copy current log beside the protected APK as {@code *-protect.log}.</summary>
+    /// <summary>Copy current log under {@code <outputDir>/Log/*-protect.log}.</summary>
     public string? MirrorBesideOutput(string outputApk)
     {
         try
@@ -52,8 +52,9 @@ public sealed class ProtectLogWriter : IDisposable
             }
             if (string.IsNullOrWhiteSpace(outputApk) || !File.Exists(LogPath))
                 return null;
-            var dir = Path.GetDirectoryName(outputApk);
-            if (string.IsNullOrEmpty(dir)) return null;
+            var parent = Path.GetDirectoryName(outputApk);
+            if (string.IsNullOrEmpty(parent)) return null;
+            var dir = Path.Combine(parent, "Log");
             Directory.CreateDirectory(dir);
             var dest = Path.Combine(dir,
                 Path.GetFileNameWithoutExtension(outputApk) + "-protect.log");

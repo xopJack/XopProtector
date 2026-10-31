@@ -83,7 +83,8 @@ struct ShellConfig {
      * Bitmask of FLAG_DISABLE_* from risk.h.
      * Default 48 = disable Root(16)+Emulator(32) until config.json loads.
      */
-    std::atomic<int> risk_flags{48};
+    /** Default matches risk.h DEFAULT_RISK_FLAGS (Root+Emu+CRC off → 0x32). */
+    std::atomic<int> risk_flags{50};
     /** How to react when a detector fires. Default Block. */
     std::atomic<int> rasp_action{static_cast<int>(RaspAction::Block)};
     /** Lowercase hex SHA-256 of APK signing cert; empty = fail closed. */

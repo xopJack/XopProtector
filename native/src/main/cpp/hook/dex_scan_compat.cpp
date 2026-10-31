@@ -7,6 +7,8 @@
 
 #include <cstdint>
 #include <cstring>
+#include <dlfcn.h>
+#include <link.h>
 #include <mutex>
 #include <string>
 #include <sys/mman.h>
@@ -26,6 +28,72 @@ using OpenDexN = jlong (*)(JNIEnv*, jclass, jstring, jstring, jint);
 
 OpenDexO g_orig_o = nullptr;
 OpenDexN g_orig_n = nullptr;
+
+static uintptr_t clear_thumb(uintptr_t p) {
+    return p & ~static_cast<uintptr_t>(1);
+}
+
+/**
+ * jmethodID must be a real ArtMethod*. Index-mode ART encodes
+ * (index << 1) | 1 — lowest bit set; index 1 yields fault addr 0x3.
+ */
+static bool is_pointer_jmethod_id(jmethodID mid) {
+    if (mid == nullptr) {
+        return false;
+    }
+    auto addr = reinterpret_cast<uintptr_t>(mid);
+    if (addr < 4096) {
+        return false;
+    }
+    if ((addr & 1u) != 0) {
+        return false;
+    }
+    return true;
+}
+
+struct ExecPhdrCtx {
+    uintptr_t addr = 0;
+    bool found = false;
+};
+
+static int exec_phdr_cb(struct dl_phdr_info* info, size_t /*size*/, void* data) {
+    auto* ctx = static_cast<ExecPhdrCtx*>(data);
+    if (info == nullptr || ctx == nullptr) {
+        return 0;
+    }
+    for (ElfW(Half) i = 0; i < info->dlpi_phnum; ++i) {
+        const ElfW(Phdr)* ph = &info->dlpi_phdr[i];
+        if (ph->p_type != PT_LOAD || (ph->p_flags & PF_X) == 0) {
+            continue;
+        }
+        uintptr_t start = static_cast<uintptr_t>(info->dlpi_addr) + ph->p_vaddr;
+        uintptr_t end = start + ph->p_memsz;
+        if (ctx->addr >= start && ctx->addr < end) {
+            ctx->found = true;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/** True when addr (Thumb bit cleared) lies in a PF_X LOAD segment of some ELF. */
+static bool is_executable_code_addr(void* fn) {
+    if (fn == nullptr) {
+        return false;
+    }
+    uintptr_t addr = clear_thumb(reinterpret_cast<uintptr_t>(fn));
+    if (addr < 4096) {
+        return false;
+    }
+    Dl_info dli{};
+    if (dladdr(reinterpret_cast<void*>(addr), &dli) == 0 || dli.dli_fbase == nullptr) {
+        return false;
+    }
+    ExecPhdrCtx ctx;
+    ctx.addr = addr;
+    dl_iterate_phdr(exec_phdr_cb, &ctx);
+    return ctx.found;
+}
 
 static bool path_equals_apk(JNIEnv* env, jstring source) {
     if (source == nullptr || g_apk.empty()) {
@@ -104,27 +172,43 @@ static bool calibrate_jni_entry_offset(JNIEnv* env) {
         env->ExceptionClear();
         return false;
     }
+    if (!is_pointer_jmethod_id(mid)) {
+        PLOGW("dex_scan_compat: jmethodid-index (nativeVersion) — fail-open");
+        return false;
+    }
     // Address registered in JNI_OnLoad for JniBridge.nativeVersion.
-    auto known = reinterpret_cast<uintptr_t>(&protector::runtime::native_version);
-    // ARM Thumb: clear low bit when comparing (ArtMethod may store either form).
-    auto norm = [](uintptr_t p) -> uintptr_t { return p & ~static_cast<uintptr_t>(1); };
+    auto known = clear_thumb(reinterpret_cast<uintptr_t>(&protector::runtime::native_version));
 
+    // One ArtMethod only: 32 bytes on 64-bit, 24 on 32-bit. Require unique hit.
+    constexpr size_t kMaxScan = (sizeof(void*) == 8) ? 32 : 24;
     auto* base = reinterpret_cast<uint8_t*>(mid);
-    constexpr size_t kMaxScan = 384;
+    size_t hits = 0;
+    size_t hit_off = 0;
     for (size_t off = 0; off + sizeof(void*) <= kMaxScan; off += sizeof(void*)) {
         void* slot;
         memcpy(&slot, base + off, sizeof(void*));
-        if (norm(reinterpret_cast<uintptr_t>(slot)) == norm(known)) {
-            g_jni_entry_offset = off;
-            PLOGI("dex_scan_compat: jni entry offset=%zu", off);
-            return true;
+        if (clear_thumb(reinterpret_cast<uintptr_t>(slot)) == known) {
+            ++hits;
+            hit_off = off;
         }
     }
-    PLOGW("dex_scan_compat: ArtMethod JNI entry not found (fail-open)");
-    return false;
+    if (hits == 0) {
+        PLOGW("dex_scan_compat: calibrate-miss (fail-open)");
+        return false;
+    }
+    if (hits != 1) {
+        PLOGW("dex_scan_compat: calibrate-ambiguous hits=%zu (fail-open)", hits);
+        return false;
+    }
+    g_jni_entry_offset = hit_off;
+    PLOGI("dex_scan_compat: jni entry offset=%zu", g_jni_entry_offset);
+    return true;
 }
 
 static void* read_jni_entry(jmethodID mid) {
+    if (!is_pointer_jmethod_id(mid) || g_jni_entry_offset == 0) {
+        return nullptr;
+    }
     auto* p = reinterpret_cast<uint8_t*>(mid) + g_jni_entry_offset;
     void* slot;
     memcpy(&slot, p, sizeof(void*));
@@ -132,9 +216,21 @@ static void* read_jni_entry(jmethodID mid) {
 }
 
 static bool write_jni_entry(jmethodID mid, void* fn) {
+    if (!is_pointer_jmethod_id(mid) || g_jni_entry_offset == 0 || fn == nullptr) {
+        PLOGW("dex_scan_compat: jmethodid-index (write) — fail-open");
+        return false;
+    }
     auto* p = reinterpret_cast<uint8_t*>(mid) + g_jni_entry_offset;
+    void* cur = nullptr;
+    memcpy(&cur, p, sizeof(void*));
+    // Slot must already hold ART's JNI entry (executable code), not a data field.
+    if (!is_executable_code_addr(cur)) {
+        PLOGW("dex_scan_compat: entry-not-exec (fail-open)");
+        return false;
+    }
     if (!mprotect_art_rw(p, sizeof(void*))) {
-        PLOGW("dex_scan_compat: mprotect RW failed (trying write anyway)");
+        PLOGW("dex_scan_compat: mprotect-fail (fail-open)");
+        return false;
     }
     memcpy(p, &fn, sizeof(void*));
     // Do NOT set PROT_READ-only — shared ArtMethod pages must stay writable.
@@ -148,6 +244,10 @@ static bool install_open_o(JNIEnv* env, jclass dexFile) {
             "[Ldalvik/system/DexPathList$Element;)Ljava/lang/Object;");
     if (mid == nullptr) {
         env->ExceptionClear();
+        return false;
+    }
+    if (!is_pointer_jmethod_id(mid)) {
+        PLOGW("dex_scan_compat: jmethodid-index (openDexFileNative O) — fail-open");
         return false;
     }
     void* orig = read_jni_entry(mid);
@@ -171,6 +271,10 @@ static bool install_open_n(JNIEnv* env, jclass dexFile) {
             "(Ljava/lang/String;Ljava/lang/String;I)J");
     if (mid == nullptr) {
         env->ExceptionClear();
+        return false;
+    }
+    if (!is_pointer_jmethod_id(mid)) {
+        PLOGW("dex_scan_compat: jmethodid-index (openDexFileNative N) — fail-open");
         return false;
     }
     void* orig = read_jni_entry(mid);

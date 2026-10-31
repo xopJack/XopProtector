@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.9
+
+- Installer: ship apphost as `XopProtectorApp.exe` (shortcuts launch it). Avoids
+  MoveFile error 5 on a delete-pending / AV-locked legacy `XopProtector.exe`.
+  Legacy `XopProtector.exe` is still copied with `restartreplace` when possible.
+- Desktop / installer / packer jar version **0.7.9**.
+
+## 0.7.8
+
+- Installer tried wiping `{app}` before copy; still hit MoveFile error 5 on some
+  PCs (likely delete-pending name). Superseded by 0.7.9 rename approach.
+- Desktop / installer / packer jar version **0.7.8**.
+
+## 0.7.7
+
+- Installer in-place upgrade: `AppMutex` + `CloseApplications` (`*.*`), kill
+  running `XopProtector.exe` / bundled engine `java`, clear leftover `is-*.tmp`
+  before copy; `DisableDirPage=auto` reuses the previous install dir. Desktop
+  holds a named mutex so Setup can detect a live UI.
+- Desktop / installer / packer jar / native version **0.7.7**.
+
+## 0.7.6
+
+- Protect sidecar logs/reports go under `<outputDir>/Log/` (not beside the APK):
+  `*-protect.log`, `*-size_report.json`, `*-so_text_diag.json`. Desktop resolve
+  still falls back to the legacy beside-APK layout for older jobs.
+- RASP: default `risk_flags` disable libc `.text` CRC (`FLAG_DISABLE_CRC_DETECT`,
+  default `0x32`). Whole-section file≠mem CRC is a high false-positive on
+  HyperOS/ColorOS and must not Block alone.
+- `verify_libc_text_crc`: on mismatch log fail-open only — never `CRASH_ILL`.
+  Inline-hook detection stays on `libc_export_hooked` / Frida composite.
+- Desktop / installer / packer jar / native version **0.7.6**.
+
+## 0.7.5
+
+- DexScanCompat: fail-open before ArtMethod JNI patch on index-mode
+  `jmethodID` (ColorOS `SIGSEGV` @ `0x3`), ambiguous calibrate hits,
+  `mprotect` failure, or non-executable entry slot. Pointer-mode hook
+  behavior unchanged.
+- Desktop / installer / packer jar / native version **0.7.5**.
+
 ## 0.7.4
 
 - Defer business-SO `bytehook` dlopen hooks until after the first UI frames;
@@ -379,7 +420,7 @@
 ### Desktop — protect log persist + selectable console
 - Harden log is a read-only selectable TextBox (Ctrl+C / Copy / Select all).
 - Each job writes UTF-8 log to `%AppData%\XOP Protector\logs\yyyyMMdd-HHmmss_<apk>.log`.
-- On finish, also mirrors `<output>-protect.log` beside the APK when possible.
+- On finish, also mirrors `<outputDir>/Log/<output>-protect.log` when possible.
 - History stores `protectLog` path.
 
 ### Desktop — security report score (stable + higher)
@@ -494,7 +535,7 @@
   (default 8), `--protect-so-abi <abi>|all` (default all).
 - `--protect-so-mode max`: same industry skips, **no** size budget (prior full encrypt).
 - `--protect-so-mode aggressive`: shell+reloc only + soft budget truncate + WARN.
-- Emits `size_report` (stdout + `<out>-size_report.json` + assets placeholder).
+- Emits `size_report` (stdout + `<outDir>/Log/<out>-size_report.json` + assets placeholder).
 - Runtime unchanged: unlisted SO basenames in `sokeys.bin` are not decrypted.
 
 ## 0.6.11 — Startup perf (SO warm reuse + critical preload)

@@ -112,7 +112,8 @@ public final class ProtectOptions {
     public String certSha256Override;
 
     /** Default: disable Root+Emulator (16|32). */
-    public int riskFlags = 16 | 32;
+    /** Default: CRC+Root+Emulator off (native DEFAULT_RISK_FLAGS → 50). */
+    public int riskFlags = 2 | 16 | 32;
     /** 0=alert, 1=degrade, 2=block. */
     public int raspAction = 2;
     public boolean reportEnabled = true;

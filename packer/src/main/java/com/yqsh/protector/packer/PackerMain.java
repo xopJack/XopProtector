@@ -87,10 +87,10 @@ public class PackerMain {
     /** Optional override for config app_sign_sha256 (hex). */
     private String certSha256Override;
     /**
-     * risk_flags bitmask (see native risk.h). Default disables Root+Emulator.
-     * FLAG_DISABLE_ROOT=16, FLAG_DISABLE_EMULATOR=32 → 48.
+     * risk_flags bitmask (see native risk.h). Default disables Root+Emulator+CRC.
+     * FLAG_DISABLE_CRC=2, FLAG_DISABLE_ROOT=16, FLAG_DISABLE_EMULATOR=32 → 50.
      */
-    private int riskFlags = 16 | 32;
+    private int riskFlags = 2 | 16 | 32;
     /** rasp_action: 0=alert, 1=degrade, 2=block (default). */
     private int raspAction = 2;
     /** Write threats.log / ring buffer (default on). */
@@ -382,7 +382,7 @@ public class PackerMain {
         System.err.println("                     Prefer loadLibrary after Application attach.");
         System.err.println("  --so-diag          embed so_diag=true (Release [XOP-SO] logs; or setprop");
         System.err.println("                     debug.protector.so_diag=1)");
-        System.err.println("  --risk-flags      bitmask (default 48 = disable Root+Emulator)");
+        System.err.println("  --risk-flags      bitmask (default 50 = disable CRC+Root+Emulator)");
         System.err.println("  --rasp-action     0=alert 1=degrade 2=block (default 2)");
         System.err.println("  --report-enabled  threat log/ring (default 1)");
         System.err.println("  --json-progress   emit NDJSON progress events on stdout (desktop UI)");
@@ -868,7 +868,7 @@ public class PackerMain {
 
             embedJunkCodeDex(unpack, work.toFile());
 
-            // size_report placeholder (output_mb refined beside output after pack)
+            // size_report placeholder (output_mb refined under Log/ after pack)
             String reportPlaceholder = BusinessSoProtector.buildSizeReportJson(
                     inputBytes, inputBytes, soResult, wroteSokeys);
             Files.writeString(new File(assetsProtector, "size_report.json").toPath(),
@@ -914,15 +914,18 @@ public class PackerMain {
             long outputBytes = outputApk.length();
             String sizeReport = BusinessSoProtector.buildSizeReportJson(
                     inputBytes, outputBytes, soResult, wroteSokeys);
-            reportBeside = new File(outputApk.getParentFile(),
-                    outputApk.getName().replace(".apk", "") + "-size_report.json");
+            File logDir = new File(outputApk.getParentFile(), "Log");
+            if (!logDir.isDirectory() && !logDir.mkdirs()) {
+                throw new IOException("Cannot create Log dir: " + logDir.getAbsolutePath());
+            }
+            String outBase = outputApk.getName().replace(".apk", "");
+            reportBeside = new File(logDir, outBase + "-size_report.json");
             Files.writeString(reportBeside.toPath(), sizeReport, StandardCharsets.UTF_8);
             System.out.println("=== size_report ===");
             System.out.print(sizeReport);
             System.out.println("Wrote " + reportBeside.getAbsolutePath());
             if (soResult != null) {
-                File diagBeside = new File(outputApk.getParentFile(),
-                        outputApk.getName().replace(".apk", "") + "-so_text_diag.json");
+                File diagBeside = new File(logDir, outBase + "-so_text_diag.json");
                 Files.writeString(diagBeside.toPath(),
                         BusinessSoProtector.buildSoTextDiagJson(soResult),
                         StandardCharsets.UTF_8);

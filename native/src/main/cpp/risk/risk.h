@@ -16,11 +16,15 @@ constexpr int FLAG_DISABLE_EMULATOR_DETECT = 1 << 5;
 constexpr int FLAG_DISABLE_SO_INTEGRITY = 1 << 6;
 
 /**
- * Packer default: disable Root + Emulator (highest false-positive rate on
- * OEM / CI devices). Frida / CRC / anti-debug / Xposed / SO integrity stay on.
+ * Packer default: disable Root + Emulator + libc .text CRC (highest
+ * false-positive rate on OEM / CI). HyperOS/ColorOS often remap libc so
+ * file≠mem CRC is not a reliable Block signal. Frida prologue hooks,
+ * anti-debug, Xposed, SO integrity stay on.
  */
 constexpr int DEFAULT_RISK_FLAGS =
-        FLAG_DISABLE_ROOT_DETECT | FLAG_DISABLE_EMULATOR_DETECT;
+        FLAG_DISABLE_ROOT_DETECT
+        | FLAG_DISABLE_EMULATOR_DETECT
+        | FLAG_DISABLE_CRC_DETECT;
 
 class RiskChecker {
 public:

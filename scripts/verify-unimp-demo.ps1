@@ -69,7 +69,7 @@ $openLine = (adb logcat -d | Select-String -Pattern "\[XOP-DEMO\] openUniMP appi
 if ($openLine) { Write-Host "open: $($openLine.Line.Trim())" }
 
 if ($Mode -eq "protected") {
-    $report = Join-Path $Root "executable\unimp-demo-protected-size_report.json"
+    $report = Join-Path $Root "executable\Log\unimp-demo-protected-size_report.json"
     if (Test-Path $report) {
         $hits = ([regex]::Matches((Get-Content $report -Raw), '"uniapp/runtime"')).Count
         Write-Host "size_report uniapp/runtime hits=$hits"

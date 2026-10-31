@@ -1063,7 +1063,7 @@ jstring read_application_name(JNIEnv* env, jclass) {
 }
 
 jstring native_version(JNIEnv* env, jclass) {
-    return env->NewStringUTF("protector-native/0.7.4");
+    return env->NewStringUTF("protector-native/0.7.7");
 }
 
 jboolean environment_degraded(JNIEnv*, jclass) {

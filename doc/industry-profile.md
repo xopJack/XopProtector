@@ -12,7 +12,7 @@ Auto True-VMP toggles are specified in [`auto-true-vmp-contract.md`](auto-true-v
 | Package hollow | **Off** (no package-wide hollow) |
 | Auto True-VMP | **Defaults:** `PaymentVmpRules` **on** + [`IndustryVmpRules`](../packer/src/main/java/com/yqsh/protector/packer/IndustryVmpRules.java) **on** (license / activate / encrypt / … tokens), **scoped to Manifest `package` only** (0.6.25+). Override with CLI below. |
 | SO protect | On by default; budget **48 MB**, max file **24 MB** unless CLI overrides |
-| Root / emulator RASP | Still disabled by default (`risk_flags=48`) — industry devices often rooted |
+| Root / emulator / libc CRC RASP | Disabled by default (`risk_flags=50`) — OEM false positives |
 
 ### Auto True-VMP overrides (Phase 1+)
 

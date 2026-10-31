@@ -273,7 +273,7 @@ See also `installer\README.md`.
 - Packer **skips** SOs whose dynamic relocs patch `.text` (would break after encrypt).
 - Runtime uses ELF `load_bias = map_start - first_PT_LOAD.p_vaddr` for decrypt.
 - Demo: `libdemo_biz.so` (`Business.nativeAddRaw` / `soProbe`).
-- After pack: `size_report` on stdout and `<out>-size_report.json`.
+- After pack: `size_report` on stdout and `<outDir>/Log/<out>-size_report.json`.
 
 ## Build / release
 ```bat

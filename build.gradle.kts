@@ -461,7 +461,7 @@ tasks.register("protectUnimpDemo") {
                 "--keypass", "android"
             )
         }
-        val report = rootProject.file("executable/unimp-demo-protected-size_report.json")
+        val report = rootProject.file("executable/Log/unimp-demo-protected-size_report.json")
         if (report.isFile) {
             val text = report.readText()
             val uniappHits = Regex("\"uniapp/runtime\"").findAll(text).count()
