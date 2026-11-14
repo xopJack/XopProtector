@@ -146,6 +146,17 @@ public final class BusinessSoProtector {
             // previously encrypted only v7a while arm64 stayed plaintext → RC4 corrupt.
             "libpag",
             "liblibpag",
+            // Pangle / CSJ / GroMore — self-extract + integrity; .text RC4 → SIGSEGV
+            // in plugin load path (libpanglearmor / csj_api_main).
+            "libpangle",
+            "libtt_",
+            "libttsdk",
+            "libttmplayer",
+            "libtt_ugen",
+            "libtobembed",
+            "libpgl",
+            "libavmdl",
+            "libumeng",
             "libicu",
             "libharfbuzz",
             "libfreetype",

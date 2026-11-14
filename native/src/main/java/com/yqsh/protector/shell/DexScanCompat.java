@@ -12,6 +12,7 @@ import java.io.FileOutputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.zip.Deflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -24,17 +25,66 @@ import java.util.zip.ZipOutputStream;
  * the call looks like a class-name scan ({@code outputName == null},
  * {@code ClassLoader == null}). Fail-open on any error.
  *
- * <p>No lambdas / anonymous classes: shell may run before full multidex; R8
- * synthetics have caused {@code NoSuchMethodError} on the early ClassLoader path.
+ * <p>Cold start: {@link #prefetchFacadeAsync} runs beside parallel dex2oat so the
+ * multi‑MB zip copy overlaps oat work; {@link #install} joins then hooks.
+ * Zip uses {@link Deflater#NO_COMPRESSION} (STORED-like) to avoid deflate CPU.
+ *
+ * <p>No lambdas / anonymous classes beyond a named {@link Runnable}: shell may run
+ * before full multidex; R8 synthetics have caused {@code NoSuchMethodError} on the
+ * early ClassLoader path.
  */
 @Keep
 public final class DexScanCompat {
     private static final String TAG = "protector.DexScan";
     static final String FACADE_ZIP = "scan_facade.zip";
     private static final String FACADE_STAMP = "scan_facade.stamp";
+    private static final long PREFETCH_JOIN_MS = 90_000L;
+
     private static boolean installed;
+    private static final Object PREFETCH_LOCK = new Object();
+    private static Thread prefetchThread;
+    private static File prefetchDir;
 
     private DexScanCompat() {
+    }
+
+    /**
+     * Kick facade zip build on a background thread (no-op when stamp is warm).
+     * Call after dexes are on disk / read-only and <b>before</b> slow
+     * {@code makePathElements}, so IO overlaps dex2oat.
+     */
+    public static void prefetchFacadeAsync(File protectorDir) {
+        if (protectorDir == null) {
+            return;
+        }
+        try {
+            if (!JniBridge.dexScanCompatEnabled()) {
+                return;
+            }
+            List<File> dexes = DexMerger.listExistingDexes(protectorDir);
+            if (dexes.isEmpty()) {
+                return;
+            }
+            if (facadeUpToDate(protectorDir, dexes)) {
+                Log.i(TAG, "prefetch skip — facade warm");
+                return;
+            }
+            synchronized (PREFETCH_LOCK) {
+                if (prefetchThread != null && prefetchThread.isAlive()
+                        && protectorDir.equals(prefetchDir)) {
+                    return;
+                }
+                prefetchDir = protectorDir;
+                PrefetchRunnable task = new PrefetchRunnable(protectorDir);
+                Thread t = new Thread(task, "protector-dexscan-facade");
+                t.setPriority(Thread.NORM_PRIORITY - 1);
+                prefetchThread = t;
+                t.start();
+                Log.i(TAG, "prefetch facade started dexes=" + dexes.size());
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "prefetchFacadeAsync skipped", t);
+        }
     }
 
     /** Call after a successful {@link DexMerger#merge}. Fail-open. */
@@ -48,6 +98,7 @@ public final class DexScanCompat {
                 installed = true;
                 return;
             }
+            joinPrefetch(protectorDir);
             List<File> dexes = DexMerger.listExistingDexes(protectorDir);
             if (dexes.isEmpty()) {
                 Log.i(TAG, "no business dex — skip");
@@ -73,7 +124,48 @@ public final class DexScanCompat {
         }
     }
 
+    private static void joinPrefetch(File protectorDir) {
+        Thread t;
+        synchronized (PREFETCH_LOCK) {
+            t = prefetchThread;
+            if (t == null || prefetchDir == null || !protectorDir.equals(prefetchDir)) {
+                return;
+            }
+        }
+        if (!t.isAlive()) {
+            return;
+        }
+        long t0 = System.currentTimeMillis();
+        try {
+            t.join(PREFETCH_JOIN_MS);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            Log.w(TAG, "prefetch join interrupted");
+            return;
+        }
+        if (t.isAlive()) {
+            Log.w(TAG, "prefetch join timeout " + PREFETCH_JOIN_MS + "ms — build sync");
+        } else {
+            Log.i(TAG, "prefetch join waited " + (System.currentTimeMillis() - t0) + "ms");
+        }
+    }
+
+    private static boolean facadeUpToDate(File protectorDir, List<File> dexes) {
+        File facade = new File(protectorDir, FACADE_ZIP);
+        File stampFile = new File(protectorDir, FACADE_STAMP);
+        if (!facade.isFile() || facade.length() == 0 || !stampFile.isFile()) {
+            return false;
+        }
+        return buildStamp(dexes).equals(readStamp(stampFile));
+    }
+
     private static File ensureFacade(File protectorDir, List<File> dexes) throws Exception {
+        synchronized (PREFETCH_LOCK) {
+            return ensureFacadeLocked(protectorDir, dexes);
+        }
+    }
+
+    private static File ensureFacadeLocked(File protectorDir, List<File> dexes) throws Exception {
         File facade = new File(protectorDir, FACADE_ZIP);
         File stampFile = new File(protectorDir, FACADE_STAMP);
         String stamp = buildStamp(dexes);
@@ -90,16 +182,18 @@ public final class DexScanCompat {
         long t0 = System.currentTimeMillis();
         FileOutputStream fos = new FileOutputStream(tmp);
         try {
-            ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(fos));
+            ZipOutputStream zos = new ZipOutputStream(new BufferedOutputStream(fos, 512 * 1024));
             try {
-                byte[] buf = new byte[256 * 1024];
+                // Level 0 ≈ store: avoids multi‑MB deflate on cold start (was ~15s).
+                zos.setLevel(Deflater.NO_COMPRESSION);
+                byte[] buf = new byte[512 * 1024];
                 for (int i = 0; i < dexes.size(); i++) {
                     File dex = dexes.get(i);
                     ZipEntry entry = new ZipEntry(dex.getName());
                     zos.putNextEntry(entry);
                     FileInputStream fin = new FileInputStream(dex);
                     try {
-                        BufferedInputStream in = new BufferedInputStream(fin);
+                        BufferedInputStream in = new BufferedInputStream(fin, 512 * 1024);
                         try {
                             int n;
                             while ((n = in.read(buf)) > 0) {
@@ -141,7 +235,7 @@ public final class DexScanCompat {
         try {
             OutputStream out = new FileOutputStream(to);
             try {
-                byte[] buf = new byte[256 * 1024];
+                byte[] buf = new byte[512 * 1024];
                 int n;
                 while ((n = in.read(buf)) > 0) {
                     out.write(buf, 0, n);
@@ -192,6 +286,28 @@ public final class DexScanCompat {
                 out.close();
             }
         } catch (Exception ignored) {
+        }
+    }
+
+    /** Named Runnable — avoids R8 ExternalSyntheticLambda on early CL. */
+    private static final class PrefetchRunnable implements Runnable {
+        private final File dir;
+
+        PrefetchRunnable(File dir) {
+            this.dir = dir;
+        }
+
+        @Override
+        public void run() {
+            try {
+                List<File> dexes = DexMerger.listExistingDexes(dir);
+                if (dexes.isEmpty()) {
+                    return;
+                }
+                ensureFacade(dir, dexes);
+            } catch (Throwable t) {
+                Log.w(TAG, "prefetch facade failed", t);
+            }
         }
     }
 }

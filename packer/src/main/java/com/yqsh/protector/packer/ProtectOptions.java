@@ -145,6 +145,26 @@ public final class ProtectOptions {
     public boolean dexScanCompat = true;
 
     /**
+     * Class-split: also treat one-level parent of applicationId as business
+     * ({@code com.foo.bar.app} → {@code Lcom/foo/bar/}). Default on. Never
+     * expands to company-root {@code Lcom/foo/}. CLI:
+     * {@code --no-business-parent-prefix}.
+     */
+    public boolean businessParentPrefix = true;
+
+    /**
+     * Class-split: auto-include non-SDK DEX package prefixes with enough
+     * classes. Default on. CLI: {@code --no-business-auto-discover}.
+     */
+    public boolean businessAutoDiscover = true;
+
+    /**
+     * Min classes for {@link #businessAutoDiscover} (default
+     * {@link BusinessPrefixDiscovery#DEFAULT_DISCOVER_MIN_CLASSES}).
+     */
+    public int businessDiscoverMinClasses = BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES;
+
+    /**
      * Phase 3 — proxy/VPN detect + optional cert pin list.
      * CLI: {@code --detect-proxy} / {@code --pin-certs <file>}.
      * Desktop UI currently hidden; use packer CLI to enable.

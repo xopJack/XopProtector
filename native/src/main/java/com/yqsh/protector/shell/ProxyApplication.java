@@ -294,9 +294,10 @@ public class ProxyApplication extends Application {
             return;
         }
         File dir = ensureDexesOnDisk(context);
-        // ACF already ran heavy init — only bind Context + signature/heartbeat.
-        // AppComponentFactory (API 28+). Do not touch ProxyComponentFactory on older
-        // APIs — loading it fails verification (superclass AppComponentFactory missing).
+        // ACF already ran heavy init (incl. DexMerger.merge) — only bind Context +
+        // signature/heartbeat. API 28+: AppComponentFactory. API <28: this branch is
+        // false → fall through and merge here before any real Application work.
+        // Do not load ProxyComponentFactory on older APIs (missing AppComponentFactory).
         if (Build.VERSION.SDK_INT >= 28 && ProxyComponentFactory.isBootstrapped()) {
             NativeLibDirRedirect.apply(context, dir);
             JniBridge.verifySignature(context);

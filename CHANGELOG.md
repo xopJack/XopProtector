@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.8.1
+
+- Class-split business discovery (beyond bare `applicationId`):
+  - Always scan Manifest **Activity / Service / Receiver / Provider / Application**
+    `android:name` → package-prefix union.
+  - Default **one-level parent** of applicationId (`com.foo.bar.app` → also
+    `Lcom/foo/bar/`; never company-root `Lcom/foo/`). CLI:
+    `--no-business-parent-prefix`.
+  - Default **non-SDK DEX package clustering** (min classes via
+    `--business-discover-min-classes`, default 8). CLI:
+    `--no-business-auto-discover`.
+- Discovery safety: Manifest/cluster prefixes must sit under the app **vendor
+  root** (first two package segments, e.g. `Lcom/ideack/`); SDK + known ad
+  obfuscation namespaces (`byazt` / Pangle / GDT / …) are denied. Fixes crash
+  when ad Activities were class-split as business.
+- SAFE/MAX SO skip: Pangle/CSJ/GroMore native libs (`libpangle*`, `libtt_*`,
+  `libPgl*`, `libavmdl*`, `libumeng*`, …) — encrypting them SIGSEGVs on plugin
+  `loadLibrary`.
+- Desktop / installer / packer jar version **0.8.1**.
+
+## 0.8.0
+
+- DEX packing **always class-splits** by `DexLayout.isBusinessType` (applicationId
+  prefix, `--hollow-prefix`, payment / industry / true-VMP rules): matching classes
+  go into encrypted `dexes.zip` (then hollow / VMP); non-business classes stay in
+  the APK root for install-time AOT. DexMerger prepends the extract at runtime.
+- Mixed DEX plain side **strips** business classes when safe. If the plain set
+  contains DexPool-fragile packages (e.g. `Landroidx/compose/`), that file keeps
+  the **original** root DEX (`KEEP_FULL_UNPROTECTED`) — business types may still
+  appear in the APK root for that file; logs/WARN mark it. Do **not** treat those
+  files as “extracted / thinned / business removed”.
+- Pure business DEX: no root copy. Pure non-business: original bytes (no DexPool).
+- `--dex-layout` deprecated (legacy values ignored with a warning).
+- Parallel DEX load: each worker uses `oat/p{i}/`; serial fallback uses
+  `oat/serial/` so timeout/`shutdownNow` cannot race dex2oat on the same dir.
+- Warn when class-split extracts **0** business classes (applicationId prefix
+  often narrower than real code namespaces — use `--hollow-prefix`).
+- Lazy SO decrypt cold-start improvements retained.
+- Desktop / installer / packer jar version **0.8.0**.
+
 ## 0.7.9
 
 - Installer: ship apphost as `XopProtectorApp.exe` (shortcuts launch it). Avoids

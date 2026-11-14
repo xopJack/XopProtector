@@ -10,7 +10,7 @@
 ; best-effort synced afterward (restartreplace if still locked).
 
 #define MyAppName "XopProtector"
-#define MyAppVersion "0.7.9"
+#define MyAppVersion "0.8.1"
 #define MyAppPublisher "XOP"
 #define MyAppExeName "XopProtectorApp.exe"
 #define MyAppLegacyExeName "XopProtector.exe"

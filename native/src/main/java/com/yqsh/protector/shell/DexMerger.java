@@ -16,6 +16,10 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Enumeration;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -23,6 +27,14 @@ import java.util.zip.ZipFile;
 public final class DexMerger {
     private static final String TAG = "protector.DexMerger";
     private static final String PREPATCHED_MARK = ".prepatched";
+
+    /**
+     * API≤27: skip oat dir. API 24 had ART AllocObject SIGSEGV with secondary-dex
+     * dex2oat; API 26–27 (8.0/8.1) often hit empty/failing dex2oat + Permission denied
+     * on protector oat paths. Parallel load only helps when oatDir is used (API 28+).
+     */
+    private static final int OAT_DIR_MIN_API = 28;
+
     private static boolean merged;
 
     private DexMerger() {
@@ -96,17 +108,22 @@ public final class DexMerger {
                 }
             }
             File oatDir = new File(protectorDir, "oat");
-            // API≤24: dex2oat(speed) on protector secondary dex → ART AllocObject
-            // SIGSEGV after makeApplication on x86_64. Load without optimized dir.
-            if (Build.VERSION.SDK_INT <= 24) {
+            if (Build.VERSION.SDK_INT < OAT_DIR_MIN_API) {
                 oatDir = null;
-                Log.i(TAG, "skip oat dir on API " + Build.VERSION.SDK_INT);
+                Log.i(TAG, "skip oat dir on API " + Build.VERSION.SDK_INT
+                        + " (minOatApi=" + OAT_DIR_MIN_API + ")");
             } else if (!oatDir.exists() && !oatDir.mkdirs()) {
                 Log.w(TAG, "cannot create oat dir: " + oatDir.getAbsolutePath());
                 oatDir = null;
             }
+            // Overlap multi-MB scan_facade.zip IO with parallel dex2oat.
+            try {
+                DexScanCompat.prefetchFacadeAsync(protectorDir);
+            } catch (Throwable t) {
+                Log.w(TAG, "DexScanCompat prefetch skipped", t);
+            }
             long tLoad = System.currentTimeMillis();
-            Object[] extra = makePathElements(dexFiles, oatDir);
+            Object[] extra = loadDexElements(dexFiles, oatDir, warm);
             Log.i(TAG, "makePathElements done in " + (System.currentTimeMillis() - tLoad)
                     + "ms extra=" + extra.length);
             Object pathList = getField(classLoader, "pathList");
@@ -199,19 +216,188 @@ public final class DexMerger {
         return result;
     }
 
+    /**
+     * oatDir + multi-dex → parallel system makePathElements(one file) with ordered
+     * concat. Each parallel worker uses {@code oat/p{i}/} so cold/warm CLC stays
+     * stable across launches and workers never share one oat directory.
+     * ≤1 dex / no oat / timeout / any worker error → serial into {@code oat/serial/}
+     * (never the same dir as in-flight parallel dex2oat; never a partial Element[]).
+     */
+    private static Object[] loadDexElements(List<File> dexFiles, File oatDir, boolean warm)
+            throws Exception {
+        if (!shouldParallelLoad(dexFiles, oatDir)) {
+            return makePathElementsSerial(dexFiles, oatDir);
+        }
+        Object[] parallel = makePathElementsParallel(dexFiles, oatDir);
+        if (parallel != null) {
+            Log.i(TAG, "parallel load ok warm=" + warm + " files=" + dexFiles.size()
+                    + " elements=" + parallel.length);
+            return parallel;
+        }
+        File serialOat = ensureOatSubdir(oatDir, "serial");
+        Log.w(TAG, "parallel load incomplete — serial fallback files=" + dexFiles.size()
+                + " oat=" + (serialOat != null ? serialOat.getName() : "null"));
+        return makePathElementsSerial(dexFiles, serialOat != null ? serialOat : oatDir);
+    }
+
+    private static boolean shouldParallelLoad(List<File> dexFiles, File oatDir) {
+        return oatDir != null
+                && dexFiles != null
+                && dexFiles.size() >= 2;
+    }
+
+    /**
+     * Wall-clock budget for parallel join. Floor 20s; scales with dex count so large
+     * multidex does not false-timeout. On expiry: discard all parallel parts → serial.
+     */
+    private static long parallelTimeoutMs(int dexCount) {
+        return Math.max(20_000L, 8_000L * (long) dexCount);
+    }
+
+    /**
+     * @return concatenated Elements in input order, or {@code null} to force serial
+     *         fallback (timeout / worker throwable / empty aggregate).
+     */
+    private static Object[] makePathElementsParallel(List<File> dexFiles,
+                                                     File optimizedDirectory) {
+        final int n = dexFiles.size();
+        int workers = Math.min(n, Math.max(1, Runtime.getRuntime().availableProcessors()));
+        ExecutorService pool = Executors.newFixedThreadPool(workers);
+        final Object[][] parts = new Object[n][];
+        final Throwable[] errors = new Throwable[n];
+        final CountDownLatch done = new CountDownLatch(n);
+        try {
+            for (int i = 0; i < n; i++) {
+                final int idx = i;
+                final File dex = dexFiles.get(i);
+                pool.execute(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            // Per-index oat subdir: no cross-worker dex2oat races; stable CLC.
+                            File workerOat = ensureOatSubdir(optimizedDirectory, "p" + idx);
+                            ArrayList<File> one = new ArrayList<>(1);
+                            one.add(dex);
+                            Object[] el = makePathElementsSerial(one,
+                                    workerOat != null ? workerOat : optimizedDirectory);
+                            parts[idx] = el;
+                        } catch (Throwable t) {
+                            errors[idx] = t;
+                        } finally {
+                            done.countDown();
+                        }
+                    }
+                });
+            }
+            long timeoutMs = parallelTimeoutMs(n);
+            boolean finished;
+            try {
+                finished = done.await(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                Log.w(TAG, "parallel load interrupted — serial fallback");
+                return null;
+            }
+            if (!finished) {
+                Log.w(TAG, "parallel load timeout " + timeoutMs + "ms — serial fallback");
+                return null;
+            }
+            for (int i = 0; i < n; i++) {
+                if (errors[i] != null) {
+                    Log.w(TAG, "parallel load error on " + dexFiles.get(i).getName()
+                            + " — serial fallback", errors[i]);
+                    return null;
+                }
+                if (parts[i] == null) {
+                    Log.w(TAG, "parallel load null part on " + dexFiles.get(i).getName()
+                            + " — serial fallback");
+                    return null;
+                }
+            }
+            return concatElementsInOrder(parts);
+        } finally {
+            // Interrupt stragglers; brief wait so serial fallback is less likely to
+            // overlap Java-side work (native dex2oat may still finish into p{i}/ only).
+            pool.shutdownNow();
+            try {
+                if (!pool.awaitTermination(2, TimeUnit.SECONDS)) {
+                    Log.w(TAG, "parallel pool still busy after shutdownNow (oat/p* isolated)");
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** {@code parent/name}; {@code null} if mkdir fails (caller falls back to parent). */
+    private static File ensureOatSubdir(File parent, String name) {
+        if (parent == null || name == null || name.isEmpty()) {
+            return parent;
+        }
+        File sub = new File(parent, name);
+        if (sub.isDirectory() || sub.mkdirs()) {
+            return sub;
+        }
+        Log.w(TAG, "cannot create oat subdir: " + sub.getAbsolutePath());
+        return null;
+    }
+
+    /** Preserve dex file order; skip empty Element arrays (per-file suppress like AOSP). */
+    private static Object[] concatElementsInOrder(Object[][] parts) {
+        int total = 0;
+        Class<?> elemType = null;
+        for (int i = 0; i < parts.length; i++) {
+            Object[] p = parts[i];
+            if (p == null || p.length == 0) {
+                continue;
+            }
+            if (elemType == null) {
+                elemType = p.getClass().getComponentType();
+            }
+            total += p.length;
+        }
+        if (elemType == null || total == 0) {
+            // All files suppressed/empty — treat as incomplete so caller can serial-retry.
+            return null;
+        }
+        Object[] combined = (Object[]) Array.newInstance(elemType, total);
+        int pos = 0;
+        for (int i = 0; i < parts.length; i++) {
+            Object[] p = parts[i];
+            if (p == null || p.length == 0) {
+                continue;
+            }
+            System.arraycopy(p, 0, combined, pos, p.length);
+            pos += p.length;
+        }
+        return combined;
+    }
+
+    /**
+     * Always pass {@link ArrayList} so both {@code makePathElements(List,…)} and
+     * {@code makeDexElements(ArrayList,…)} resolve. Each call owns its suppressed list.
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static Object[] makePathElements(List<File> dexFiles, File optimizedDirectory)
+    private static Object[] makePathElementsSerial(List<File> dexFiles, File optimizedDirectory)
             throws Exception {
         ArrayList suppressed = new ArrayList();
+        ArrayList<File> files = (dexFiles instanceof ArrayList)
+                ? (ArrayList<File>) dexFiles
+                : new ArrayList<>(dexFiles);
         Class<?> dpl = Class.forName("dalvik.system.DexPathList");
         Method make;
         try {
             make = dpl.getDeclaredMethod("makePathElements", List.class, File.class, List.class);
         } catch (NoSuchMethodException e) {
-            make = dpl.getDeclaredMethod("makeDexElements", ArrayList.class, File.class, ArrayList.class);
+            make = dpl.getDeclaredMethod(
+                    "makeDexElements", ArrayList.class, File.class, ArrayList.class);
         }
         make.setAccessible(true);
-        return (Object[]) make.invoke(null, dexFiles, optimizedDirectory, suppressed);
+        Object[] elements = (Object[]) make.invoke(null, files, optimizedDirectory, suppressed);
+        if (elements == null) {
+            return new Object[0];
+        }
+        return elements;
     }
 
     private static Object getField(Object obj, String name) throws Exception {
