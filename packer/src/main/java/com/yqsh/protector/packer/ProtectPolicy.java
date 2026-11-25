@@ -41,7 +41,11 @@ public final class ProtectPolicy {
          */
         MAX,
         /**
-         * Same as balanced (encrypt-first, no package-wide hollow).
+         * Speed-first: encrypt-first hollow (same as balanced) <strong>and</strong>
+         * narrow class-split — no {@code applicationId} / cluster prefix encrypt;
+         * only Manifest exact types, {@code --hollow-prefix}, payment/industry
+         * True-VMP, and {@code --true-vmp-prefix}. Application leaf startup-plain
+         * is opt-in via {@code --startup-plain-app-leaf} (default off).
          */
         PERF
     }

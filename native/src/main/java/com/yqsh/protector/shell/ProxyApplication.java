@@ -294,9 +294,10 @@ public class ProxyApplication extends Application {
             return;
         }
         File dir = ensureDexesOnDisk(context);
-        // ACF already ran heavy init — only bind Context + signature/heartbeat.
-        // AppComponentFactory (API 28+). Do not touch ProxyComponentFactory on older
-        // APIs — loading it fails verification (superclass AppComponentFactory missing).
+        // ACF already ran heavy init (incl. DexMerger.merge) — only bind Context +
+        // signature/heartbeat. API 28+: AppComponentFactory. API <28: this branch is
+        // false → fall through and merge here before any real Application work.
+        // Do not load ProxyComponentFactory on older APIs (missing AppComponentFactory).
         if (Build.VERSION.SDK_INT >= 28 && ProxyComponentFactory.isBootstrapped()) {
             NativeLibDirRedirect.apply(context, dir);
             JniBridge.verifySignature(context);
@@ -322,18 +323,17 @@ public class ProxyApplication extends Application {
         }
         String pkg = context.getPackageName();
         String apkPath = ai != null ? ai.sourceDir : null;
+        long t0 = System.currentTimeMillis();
         JniBridge.initApp(dir.getAbsolutePath(), pkg, apkPath);
-        // Ping before DexMerger / SO decrypt — init_app already armed the timer.
+        Log.i(TAG, "initApp done in " + (System.currentTimeMillis() - t0) + "ms");
+        // Ping before DexMerger — init_app already armed the timer.
         startHeartbeat(shell);
         NativeLibDirRedirect.apply(context, dir);
+        long tMerge = System.currentTimeMillis();
         DexMerger.merge(context.getClassLoader(), dir);
-        // API≤24 x86: defer SO preload — L2/L3 verneed is flaky; ensureBusinessSo decrypts later.
-        if (Build.VERSION.SDK_INT > 24) {
-            JniBridge.finishBusinessSoDecrypt();
-        } else {
-            Log.i(TAG, "skip finishBusinessSoDecrypt on API " + Build.VERSION.SDK_INT);
-        }
-        JniBridge.enableJunkVerify();
+        Log.i(TAG, "DexMerger.merge done in " + (System.currentTimeMillis() - tMerge) + "ms");
+        // finishBusinessSoDecrypt / junk verify / DexScanCompat.install deferred to
+        // first UI frame (see DeferredSoHooksInstaller) — not P2 (merge stays sync).
         JniBridge.verifySignature(context);
         try {
             NetGuard.install(context);
@@ -653,10 +653,15 @@ public class ProxyApplication extends Application {
     }
 
     /**
-     * Installs business-SO dlopen hooks only after the first Activity frame.
-     * Installing earlier (JNI_OnLoad / init_app) makes vendor HWUI mapper loads
-     * attribute to libprotector's clns-* namespace → GraphicBufferAllocator
-     * failure / black screen on OEM Android 12+ (see MTK linker patch).
+     * Post-first-frame startup work (not P2 — DexMerger already ran sync):
+     * <ul>
+     *   <li>finishBusinessSoDecrypt (API&gt;24)</li>
+     *   <li>enableJunkVerify</li>
+     *   <li>DexScanCompat.install</li>
+     *   <li>business-SO dlopen bytehooks (HWUI / clns-* OEM black-screen)</li>
+     * </ul>
+     * Installing SO bytehooks earlier makes vendor HWUI mapper loads attribute to
+     * libprotector's clns-* namespace → GraphicBufferAllocator failure on OEM 12+.
      * <p>No lambdas / anonymous classes — early ClassLoader / R8 synthetics.
      */
     @Keep
@@ -678,9 +683,9 @@ public class ProxyApplication extends Application {
             DeferredSoHooksInstaller cb = new DeferredSoHooksInstaller(real);
             try {
                 real.registerActivityLifecycleCallbacks(cb);
-                Log.i(TAG, "deferred SO dlopen hooks: wait first Activity resume");
+                Log.i(TAG, "deferred post-frame work: wait first Activity resume");
             } catch (Throwable t) {
-                Log.w(TAG, "register deferred SO hooks failed; install now", t);
+                Log.w(TAG, "register deferred post-frame work failed; run now", t);
                 installNow();
             }
         }
@@ -689,12 +694,44 @@ public class ProxyApplication extends Application {
             if (!sInstalled.compareAndSet(false, true)) {
                 return;
             }
+            long t0 = System.currentTimeMillis();
+            // API≤24 x86: skip SO preload — L2/L3 verneed flaky; ensureBusinessSo later.
+            if (Build.VERSION.SDK_INT > 24) {
+                try {
+                    long t = System.currentTimeMillis();
+                    JniBridge.finishBusinessSoDecrypt();
+                    Log.i(TAG, "finishBusinessSoDecrypt in "
+                            + (System.currentTimeMillis() - t) + "ms");
+                } catch (Throwable t) {
+                    Log.w(TAG, "finishBusinessSoDecrypt failed", t);
+                }
+            } else {
+                Log.i(TAG, "skip finishBusinessSoDecrypt on API " + Build.VERSION.SDK_INT);
+            }
+            try {
+                JniBridge.enableJunkVerify();
+            } catch (Throwable t) {
+                Log.w(TAG, "enableJunkVerify failed", t);
+            }
+            try {
+                File dir = DexMerger.lastProtectorDir();
+                if (dir != null) {
+                    long t = System.currentTimeMillis();
+                    DexScanCompat.install(dir);
+                    Log.i(TAG, "DexScanCompat.install in "
+                            + (System.currentTimeMillis() - t) + "ms");
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "DexScanCompat.install failed", t);
+            }
             try {
                 JniBridge.installBusinessSoHooks();
                 Log.i(TAG, "deferred SO dlopen hooks installed");
             } catch (Throwable t) {
                 Log.w(TAG, "installBusinessSoHooks failed", t);
             }
+            Log.i(TAG, "deferred post-frame work done in "
+                    + (System.currentTimeMillis() - t0) + "ms");
         }
 
         @Override

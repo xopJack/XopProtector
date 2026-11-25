@@ -52,9 +52,9 @@ public final class ProtectOptions {
 
     /**
      * Runtime SO decrypt timing (written to {@code config.json}).
-     * {@link #EAGER} — full materialize + preload at cold start (default, compatible).
+     * {@link #EAGER} — full materialize + preload at cold start.
      * {@link #LAZY} — on-demand materialize + preload existing {@code so_plain};
-     *               background fill this process (no {@code so_plain_ready} warm reuse).
+     *               background fill this process (default — faster splash).
      * CLI: {@code --so-decrypt-mode eager|lazy}.
      */
     public enum SoDecryptMode {
@@ -62,8 +62,29 @@ public final class ProtectOptions {
         LAZY
     }
 
-    /** Default {@link SoDecryptMode#EAGER} for backward-compatible cold-start behavior. */
-    public SoDecryptMode soDecryptMode = SoDecryptMode.EAGER;
+    /** Default {@link SoDecryptMode#LAZY} for faster cold-start (P0). */
+    public SoDecryptMode soDecryptMode = SoDecryptMode.LAZY;
+
+    /**
+     * Keep Manifest Application + MAIN/LAUNCHER activities plain (not in
+     * {@code dexes.zip}). Default <b>off</b> (Application encrypted). Opt in with
+     * {@code --startup-plain} for install-AOT / faster splash.
+     */
+    public boolean startupPlain = false;
+
+    /**
+     * Extra type-descriptor prefixes kept plain (repeatable CLI
+     * {@code --startup-plain-prefix}). E.g. {@code Lcom/foo/ui/activity/}.
+     */
+    public final List<String> startupPlainPrefixes = new ArrayList<>();
+
+    /**
+     * Keep Manifest Application leaf package plain
+     * ({@code Lcom/a/b/App;} → {@code Lcom/a/b/}). {@code null} or
+     * {@code false} = off (default). Opt in with
+     * {@code --startup-plain-app-leaf}.
+     */
+    public Boolean startupPlainAppLeaf = null;
 
     /** Parse {@code eager|lazy} (case-insensitive). */
     public static SoDecryptMode parseSoDecryptMode(String raw) {
@@ -143,6 +164,46 @@ public final class ProtectOptions {
      * Default <strong>on</strong>. CLI: {@code --no-dex-scan-compat}.
      */
     public boolean dexScanCompat = true;
+
+    /**
+     * Class-split: also treat one-level parent of applicationId as business
+     * ({@code com.foo.bar.app} → {@code Lcom/foo/bar/}). Default on. Never
+     * expands to company-root {@code Lcom/foo/}. CLI:
+     * {@code --no-business-parent-prefix}.
+     */
+    public boolean businessParentPrefix = true;
+
+    /**
+     * Class-split: auto-include non-SDK DEX package prefixes with enough
+     * classes. Default on. CLI: {@code --no-business-auto-discover}.
+     */
+    public boolean businessAutoDiscover = true;
+
+    /**
+     * Min classes for {@link #businessAutoDiscover} (default
+     * {@link BusinessPrefixDiscovery#DEFAULT_DISCOVER_MIN_CLASSES}).
+     */
+    public int businessDiscoverMinClasses = BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES;
+
+    /**
+     * When Manifest {@code Application} is outside applicationId vendor root,
+     * promote its leaf package (deny/SDK/minClasses gated). Default on.
+     * CLI: {@code --no-manifest-app-cross-vendor-leaf}.
+     */
+    public boolean manifestAppCrossVendorLeaf = true;
+
+    /**
+     * Add exact type descriptors for trusted Manifest components. Default on.
+     * CLI: {@code --no-manifest-business-exact}.
+     */
+    public boolean manifestBusinessExact = true;
+
+    /**
+     * Exact-match ambiguous cross-package Manifest components (never their
+     * packages). Default on so renamed apps without a custom Application still
+     * encrypt declared Activities. CLI: {@code --no-manifest-ambiguous-exact}.
+     */
+    public boolean manifestAmbiguousExact = true;
 
     /**
      * Phase 3 — proxy/VPN detect + optional cert pin list.

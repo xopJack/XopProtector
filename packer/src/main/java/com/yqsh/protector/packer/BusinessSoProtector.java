@@ -95,6 +95,58 @@ public final class BusinessSoProtector {
     };
 
     /**
+     * P0 industry EXACT rules: {@code {basenameLower, category}}.
+     * reason = {@code industry/{category}}. Sample-confirmed (harmony) + policy.
+     */
+    private static final String[][] INDUSTRY_P0_EXACT = {
+            {"libcrashsdk.so", "crash"},
+            {"libapssdk.so", "analytics/ad-aux"},
+            {"libctaapilib.so", "compliance/ad-aux"},
+            // TestSDKDemo / TPNS + JCore samples (EXACT only — not wide libxg / libj)
+            {"libxgvipsecurity.so", "cloud-push"},
+            {"libjutils.so", "jpush"},
+            // Baidu location SDK basenames do not start with libbaidu.
+            // EXACT only — liblocsdk / libindoor / libtiny would skip unrelated SOs.
+            {"liblocsdk8b.so", "location"},
+            {"libindoor.so", "location"},
+            {"libtiny_magic.so", "location"},
+    };
+
+    /**
+     * P0 industry PREFIX rules: {@code {prefixLower, category}} (23).
+     * High-confidence OEM / cloud push / analytics only — no short P1 prefixes
+     * ({@code libxg}, {@code libmcs}, {@code liboppo}, {@code libvivo}, …).
+     */
+    private static final String[][] INDUSTRY_P0_PREFIX = {
+            // oem-push
+            {"libhms", "oem-push"},
+            {"libhwpush", "oem-push"},
+            {"libhuaweipush", "oem-push"},
+            {"libmipush", "oem-push"},
+            {"libxmpush", "oem-push"},
+            {"libheytap", "oem-push"},
+            {"libvpush", "oem-push"},
+            {"libmeizu", "oem-push"},
+            {"libmzpush", "oem-push"},
+            {"libhonor", "oem-push"},
+            // cloud-push
+            {"libtpns", "cloud-push"},
+            {"libaliyun", "cloud-push"},
+            {"libalicloud", "cloud-push"},
+            {"libemas", "cloud-push"},
+            {"libmobpush", "cloud-push"},
+            // analytics
+            {"libsensors", "analytics"},
+            {"libtalkingdata", "analytics"},
+            {"libtd_", "analytics"},
+            {"libgrowing", "analytics"},
+            {"librangers", "analytics"},
+            {"libapplog", "analytics"},
+            {"libbeacon", "analytics"},
+            {"libqimei", "analytics"},
+    };
+
+    /**
      * Basename prefixes (after lowercasing). Industry SDKs / engines — never
      * customer applicationId. Matched as {@code name.startsWith(prefix)}.
      * SAFE/MAX only (AGGRESSIVE may still encrypt these).
@@ -146,6 +198,21 @@ public final class BusinessSoProtector {
             // previously encrypted only v7a while arm64 stayed plaintext → RC4 corrupt.
             "libpag",
             "liblibpag",
+            // Pangle / CSJ / GroMore — self-extract + integrity; .text RC4 → SIGSEGV
+            // in plugin load path (libpanglearmor / csj_api_main).
+            // libmaparmor: same basename ships in APK and under pangle_p/; encrypting
+            // the APK copy puts a sokey that used to RC4 the foreign plugin mapping
+            // (runtime identity gate still refuses; skip avoids the key entirely).
+            "libpangle",
+            "libmaparmor",
+            "libtt_",
+            "libttsdk",
+            "libttmplayer",
+            "libtt_ugen",
+            "libtobembed",
+            "libpgl",
+            "libavmdl",
+            "libumeng",
             "libicu",
             "libharfbuzz",
             "libfreetype",
@@ -431,17 +498,43 @@ public final class BusinessSoProtector {
         return false;
     }
 
+    /**
+     * SAFE/MAX industry compatibility hit, or {@code null}.
+     * Order: P0 EXACT → legacy EXACT → P0 PREFIX → legacy PREFIX.
+     * Return value is {@code industry/{category}} (legacy category {@code runtime}).
+     */
+    static String industryPolicyReason(String name) {
+        if (name == null || name.isEmpty()) return "industry/runtime";
+        if (isUniAppRuntimeSkip(name)) {
+            // UniApp is its own skip class; callers use skipReason, not this.
+            return null;
+        }
+        String lower = name.toLowerCase(Locale.ROOT);
+        final int slash = lower.lastIndexOf('/');
+        if (slash >= 0 && slash + 1 < lower.length()) {
+            lower = lower.substring(slash + 1);
+        }
+        for (String[] row : INDUSTRY_P0_EXACT) {
+            if (row[0].equals(lower)) return "industry/" + row[1];
+        }
+        for (String s : INDUSTRY_EXACT_SKIP) {
+            if (s.equals(lower)) return "industry/runtime";
+        }
+        for (String[] row : INDUSTRY_P0_PREFIX) {
+            if (lower.startsWith(row[0])) return "industry/" + row[1];
+        }
+        for (String p : INDUSTRY_PREFIX_SKIP) {
+            if (lower.startsWith(p.toLowerCase(Locale.ROOT))) {
+                return "industry/runtime";
+            }
+        }
+        return null;
+    }
+
     static boolean isIndustrySkip(String name) {
         if (name == null || name.isEmpty()) return true;
         if (isUniAppRuntimeSkip(name)) return true;
-        String lower = name.toLowerCase(Locale.ROOT);
-        for (String s : INDUSTRY_EXACT_SKIP) {
-            if (s.equals(lower)) return true;
-        }
-        for (String p : INDUSTRY_PREFIX_SKIP) {
-            if (lower.startsWith(p.toLowerCase(Locale.ROOT))) return true;
-        }
-        return false;
+        return industryPolicyReason(name) != null;
     }
 
     /**
@@ -470,8 +563,14 @@ public final class BusinessSoProtector {
         if (isPathDerivedJniSkip(name)) return "path_derived_jni";
         // UniApp / DCloud Weex: all modes — IPC breaks after .text RC4.
         if (isUniAppRuntimeSkip(name)) return "uniapp/runtime";
-        // Industry SDKs: SAFE/MAX only.
-        if (mode != Mode.AGGRESSIVE && isIndustrySkip(name)) return "industry/runtime";
+        // Industry SDKs: SAFE/MAX only (P0 categories + legacy industry/runtime).
+        if (mode != Mode.AGGRESSIVE) {
+            // UniApp already handled above; industryPolicyReason skips it.
+            if (!isUniAppRuntimeSkip(name)) {
+                String industry = industryPolicyReason(name);
+                if (industry != null) return industry;
+            }
+        }
         return null;
     }
 
@@ -638,17 +737,20 @@ public final class BusinessSoProtector {
                             + abiName + "/" + name);
                     continue;
                 }
-                long textSize = readTextSize(so);
-                if (textSize <= 0) {
-                    basenameAbiBlock.putIfAbsent(name, "no .text");
+                String textReason = textRangeSkipReason(so);
+                if (textReason != null) {
+                    // sokeys is basename-keyed. Encrypting only the ABI whose
+                    // .text fits would RC4 the plaintext sibling on the other ABI.
+                    basenameAbiBlock.putIfAbsent(name, textReason);
                     SoDecision d = new SoDecision(
-                            abiName, name, so.length(), 0, 0, "no .text");
+                            abiName, name, so.length(), 0, 0, textReason);
                     result.skippedPolicy.add(d);
                     logXopPackSkip(m, d);
-                    System.out.println("SKIP business SO (no .text): "
+                    System.out.println("SKIP business SO (" + textReason + "): "
                             + abiName + "/" + name);
                     continue;
                 }
+                long textSize = readTextSize(so);
                 long delta = estimateDelta(abiName, name, so.length(), textSize,
                         opts.compressedSizes, opts.storedEntries);
                 Candidate c = new Candidate(so, abiName, name, so.length(), textSize, delta);
@@ -854,6 +956,36 @@ public final class BusinessSoProtector {
             }
         }
         return Math.max(0L, Math.round(fileBytes * SIMPLE_DELTA_RATIO));
+    }
+
+    /** SHT_NOBITS: section occupies memory, not file bytes. */
+    private static final int SHT_NOBITS = 8;
+
+    /**
+     * Why {@code .text} cannot be read in place, or {@code null} when the file
+     * range fits. Callers must skip the whole basename: one bad ABI must not
+     * leave a sokey that RC4s a plaintext sibling.
+     */
+    static String textRangeSkipReason(File soFile) {
+        if (soFile == null || !soFile.isFile()) return ".text unreadable";
+        try (ReadElf elf = new ReadElf(soFile)) {
+            for (ReadElf.SectionHeader sh : elf.getSectionHeaders()) {
+                if (!".text".equals(sh.getName())) continue;
+                if (sh.getType() == SHT_NOBITS) return ".text not in file";
+                long offset = sh.getOffset();
+                long size = sh.getSize();
+                if (size <= 0) return "no .text";
+                long fileLen = soFile.length();
+                if (offset < 0 || size > Integer.MAX_VALUE
+                        || offset > fileLen || fileLen - offset < size) {
+                    return ".text exceeds file";
+                }
+                return null;
+            }
+        } catch (Exception ignored) {
+            return ".text unreadable";
+        }
+        return "no .text";
     }
 
     static long readTextSize(File soFile) {
@@ -1255,8 +1387,20 @@ public final class BusinessSoProtector {
             for (ReadElf.SectionHeader sh : elf.getSectionHeaders()) {
                 if (!".text".equals(sh.getName())) continue;
                 long offset = sh.getOffset();
-                int size = (int) sh.getSize();
-                if (size <= 0) throw new IllegalStateException("empty .text in " + soFile.getName());
+                long textSize = sh.getSize();
+                if (sh.getType() == SHT_NOBITS) {
+                    throw new IllegalStateException(".text not in file in " + soFile.getName());
+                }
+                if (textSize <= 0 || textSize > Integer.MAX_VALUE) {
+                    throw new IllegalStateException("empty .text in " + soFile.getName());
+                }
+                int size = (int) textSize;
+                long fileLen = soFile.length();
+                if (offset < 0 || offset > fileLen || fileLen - offset < size) {
+                    throw new IllegalStateException(".text exceeds file in " + soFile.getName()
+                            + " offset=0x" + Long.toHexString(offset)
+                            + " size=" + size + " file=" + fileLen);
+                }
                 byte[] plain = readAt(soFile, offset, size);
                 String sha256 = sha256Hex(plain);
                 long[] pt = findCoveringPtLoad(soFile, offset, size);

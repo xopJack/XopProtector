@@ -223,52 +223,53 @@ bool so_guard_bind_hmac(const uint8_t* hmac_key, size_t key_len, const std::stri
     return true;
 }
 
-static bool maps_rwx_on_self() {
-    if (g_so_base == 0) return false;
+/** Cap maps walks — desktop forks can expose very large /proc/self/maps. */
+constexpr int kSoGuardMapsMaxLines = 8192;
+
+struct SoGuardMapsHits {
+    bool rwx = false;
+    bool dump_tools = false;
+};
+
+/** One maps pass for RWX-on-self and dump/hook tooling. */
+static SoGuardMapsHits maps_scan_so_guard() {
+    SoGuardMapsHits hits;
     FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
+    if (!fp) return hits;
     char line[512];
-    bool hit = false;
+    int lines = 0;
     while (fgets(line, sizeof(line), fp)) {
-        unsigned long start = 0, end = 0;
-        char perms[8] = {0};
-        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
-        bool wx = (strchr(perms, 'w') != nullptr && strchr(perms, 'x') != nullptr);
-        if (!wx) continue;
-        if (strstr(line, "libprotector") != nullptr) {
-            hit = true;
-            break;
-        }
-        if (start >= g_so_base && start < g_so_base + 16ull * 1024 * 1024
-            && end > g_so_base && strstr(line, ".so") != nullptr) {
-            // Anonymous RWX abutting our SO often means inline trampoline.
-            if (strstr(line, "/") == nullptr) {
-                hit = true;
-                break;
+        if (++lines > kSoGuardMapsMaxLines) break;
+        if (!hits.dump_tools) {
+            if (strstr(line, "memdump")
+                || strstr(line, "libGameGuardian")
+                || strstr(line, "frida-gadget")
+                || strstr(line, "frida-agent")
+                || strstr(line, "libdump.so")) {
+                hits.dump_tools = true;
             }
         }
-    }
-    fclose(fp);
-    return hit;
-}
-
-static bool maps_has_dump_tools() {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
-    char line[512];
-    bool found = false;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "memdump")
-            || strstr(line, "libGameGuardian")
-            || strstr(line, "frida-gadget")
-            || strstr(line, "frida-agent")
-            || strstr(line, "libdump.so")) {
-            found = true;
-            break;
+        if (!hits.rwx && g_so_base != 0) {
+            unsigned long start = 0, end = 0;
+            char perms[8] = {0};
+            if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) == 3) {
+                bool wx = (strchr(perms, 'w') != nullptr && strchr(perms, 'x') != nullptr);
+                if (wx) {
+                    if (strstr(line, "libprotector") != nullptr) {
+                        hits.rwx = true;
+                    } else if (start >= g_so_base && start < g_so_base + 16ull * 1024 * 1024
+                            && end > g_so_base && strstr(line, ".so") != nullptr
+                            && strstr(line, "/") == nullptr) {
+                        // Anonymous RWX abutting our SO often means inline trampoline.
+                        hits.rwx = true;
+                    }
+                }
+            }
         }
+        if (hits.rwx && hits.dump_tools) break;
     }
     fclose(fp);
-    return found;
+    return hits;
 }
 
 PROTECTOR_ENCRYPT void so_guard_check() {
@@ -286,13 +287,13 @@ PROTECTOR_ENCRYPT void so_guard_check() {
         }
     }
 
-    if (maps_rwx_on_self()) {
+    const SoGuardMapsHits maps = maps_scan_so_guard();
+    if (maps.rwx) {
         PLOGW("so_guard: RWX mapping on libprotector");
         handle_risk("so_rwx", CrashKind::SigIll);
         return;
     }
-
-    if (maps_has_dump_tools()) {
+    if (maps.dump_tools) {
         PLOGW("so_guard: dump/hook tooling in maps");
         handle_risk("so_dump_tool", CrashKind::SigSegv);
     }

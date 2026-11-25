@@ -32,7 +32,7 @@ gradlew.bat exportShellFiles
 powershell -ExecutionPolicy Bypass -File scripts\release-desktop.ps1 -SkipInstaller
 ```
 
-See [README.md](../README.md#quick-start) / [README.zh-CN.md](../README.zh-CN.md#快速开始).
+See [README.md](../README.md#快速开始) / [README.en.md](../README.en.md#quick-start).
 
 ### Compatibility
 

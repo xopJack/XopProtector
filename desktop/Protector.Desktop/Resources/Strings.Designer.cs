@@ -32,6 +32,9 @@ public static class Strings
     public static string Nav_HistorySub => G(nameof(Nav_HistorySub));
     public static string Nav_Reports => G(nameof(Nav_Reports));
     public static string Nav_ReportsSub => G(nameof(Nav_ReportsSub));
+    public static string Nav_Hotfix => G(nameof(Nav_Hotfix));
+    public static string Nav_HotfixSub => G(nameof(Nav_HotfixSub));
+    public static string Msg_OpenUrlFailed => G(nameof(Msg_OpenUrlFailed));
     public static string Nav_Settings => G(nameof(Nav_Settings));
     public static string Nav_SettingsSub => G(nameof(Nav_SettingsSub));
     public static string Harden_Cancel => G(nameof(Harden_Cancel));

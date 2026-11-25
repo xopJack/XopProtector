@@ -1,4 +1,5 @@
-﻿using System.Reflection;
+﻿using System.Diagnostics;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -84,6 +85,8 @@ public partial class MainWindow : Window
         return v == null ? "0.7.9" : $"{v.Major}.{v.Minor}.{v.Build}";
     }
 
+    private const string HotfixUrl = "https://hotfix.yqsh168.cn/?from=protector";
+
     private void Nav_Click(object sender, RoutedEventArgs e)
     {
         if (sender is not Button btn || btn.Tag is not string tag)
@@ -103,12 +106,35 @@ public partial class MainWindow : Window
             _reports.Reload();
     }
 
+    /// <summary>Open hotfix portal in the default browser (does not switch in-app page).</summary>
+    private void Hotfix_Click(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = HotfixUrl,
+                UseShellExecute = true,
+            });
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                string.Format(Strings.Msg_OpenUrlFailed, HotfixUrl, ex.Message),
+                Strings.ProductName,
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+    }
+
     private void SetNavStyles()
     {
         ApplyNav(NavHarden, _nav == "harden");
         ApplyNav(NavHistory, _nav == "history");
         ApplyNav(NavReports, _nav == "reports");
         ApplyNav(NavSettings, _nav == "settings");
+        // Hotfix opens an external URL — never mark as the active in-app page.
+        ApplyNav(NavHotfix, active: false);
     }
 
     private static void ApplyNav(Button btn, bool active)

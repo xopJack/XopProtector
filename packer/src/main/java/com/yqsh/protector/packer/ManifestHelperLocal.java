@@ -2,11 +2,26 @@ package com.yqsh.protector.packer;
 
 import pxb.android.axml.AxmlParser;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.io.File;
+import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 final class ManifestHelperLocal {
+    private static final Set<String> COMPONENT_TAGS = new LinkedHashSet<>();
+
+    static {
+        COMPONENT_TAGS.add("application");
+        COMPONENT_TAGS.add("activity");
+        COMPONENT_TAGS.add("activity-alias");
+        COMPONENT_TAGS.add("service");
+        COMPONENT_TAGS.add("receiver");
+        COMPONENT_TAGS.add("provider");
+    }
+
     private ManifestHelperLocal() {}
 
     static String getApplicationName(File manifest) {
@@ -17,7 +32,7 @@ final class ManifestHelperLocal {
                 if (parser.getAttrCount() == 0) continue;
                 if (!"application".equals(parser.getName())) continue;
                 for (int i = 0; i < parser.getAttrCount(); i++) {
-                    if ("name".equals(parser.getAttrName(i))) {
+                    if ("name".equals(attrLocalName(parser.getAttrName(i)))) {
                         Object v = parser.getAttrValue(i);
                         return v == null ? null : String.valueOf(v);
                     }
@@ -48,5 +63,196 @@ final class ManifestHelperLocal {
             e.printStackTrace();
         }
         return null;
+    }
+
+    /**
+     * Raw {@code android:name} (and activity-alias {@code targetActivity}) for
+     * components that declare {@code MAIN} + {@code LAUNCHER} (or
+     * {@code LEANBACK_LAUNCHER}) in the <b>same</b> intent-filter. Relative
+     * names are not resolved here.
+     */
+    static List<String> listLauncherComponentNames(File manifest) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        if (manifest == null || !manifest.isFile()) {
+            return new ArrayList<>();
+        }
+        try {
+            byte[] data = Files.readAllBytes(manifest.toPath());
+            AxmlParser parser = new AxmlParser(data);
+            String currentName = null;
+            String currentTarget = null;
+            boolean inComponent = false;
+            boolean inFilter = false;
+            boolean hasMain = false;
+            boolean hasLauncher = false;
+            boolean launcherHit = false;
+            boolean isAlias = false;
+            int ev;
+            while ((ev = parser.next()) != AxmlParser.END_FILE) {
+                if (ev == AxmlParser.START_TAG) {
+                    String tag = parser.getName();
+                    if (tag == null) {
+                        continue;
+                    }
+                    String lower = tag.toLowerCase(Locale.ROOT);
+                    if ("activity".equals(lower) || "activity-alias".equals(lower)) {
+                        inComponent = true;
+                        inFilter = false;
+                        hasMain = false;
+                        hasLauncher = false;
+                        launcherHit = false;
+                        isAlias = "activity-alias".equals(lower);
+                        currentName = null;
+                        currentTarget = null;
+                        for (int i = 0; i < parser.getAttrCount(); i++) {
+                            String an = attrLocalName(parser.getAttrName(i));
+                            Object v = parser.getAttrValue(i);
+                            if (v == null) {
+                                continue;
+                            }
+                            String s = String.valueOf(v).trim();
+                            if (s.isEmpty()) {
+                                continue;
+                            }
+                            if ("name".equals(an)) {
+                                currentName = s;
+                            } else if ("targetActivity".equals(an)) {
+                                currentTarget = s;
+                            }
+                        }
+                    } else if (inComponent && "intent-filter".equals(lower)) {
+                        inFilter = true;
+                        // Android requires MAIN + LAUNCHER in the same filter.
+                        hasMain = false;
+                        hasLauncher = false;
+                    } else if (inFilter && "action".equals(lower)) {
+                        String action = readNameAttr(parser);
+                        if (isMainAction(action)) {
+                            hasMain = true;
+                        }
+                    } else if (inFilter && "category".equals(lower)) {
+                        String cat = readNameAttr(parser);
+                        if (isLauncherCategory(cat)) {
+                            hasLauncher = true;
+                        }
+                    }
+                } else if (ev == AxmlParser.END_TAG) {
+                    String tag = parser.getName();
+                    if (tag == null) {
+                        continue;
+                    }
+                    String lower = tag.toLowerCase(Locale.ROOT);
+                    if ("intent-filter".equals(lower)) {
+                        if (inFilter && hasMain && hasLauncher) {
+                            launcherHit = true;
+                        }
+                        inFilter = false;
+                        hasMain = false;
+                        hasLauncher = false;
+                    } else if ("activity".equals(lower) || "activity-alias".equals(lower)) {
+                        if (inComponent && launcherHit) {
+                            if (currentName != null && !currentName.isEmpty()) {
+                                names.add(currentName);
+                            }
+                            if (isAlias && currentTarget != null && !currentTarget.isEmpty()) {
+                                names.add(currentTarget);
+                            }
+                        }
+                        inComponent = false;
+                        inFilter = false;
+                        launcherHit = false;
+                        currentName = null;
+                        currentTarget = null;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("WARN: manifest launcher scan failed: " + e.getMessage());
+        }
+        return new ArrayList<>(names);
+    }
+
+    /** Strip optional {@code android:} / namespace prefix from AXML attr names. */
+    private static String attrLocalName(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        int colon = raw.lastIndexOf(':');
+        return colon >= 0 ? raw.substring(colon + 1) : raw;
+    }
+
+    private static String readNameAttr(AxmlParser parser) {
+        for (int i = 0; i < parser.getAttrCount(); i++) {
+            if ("name".equals(attrLocalName(parser.getAttrName(i)))) {
+                Object v = parser.getAttrValue(i);
+                return v == null ? null : String.valueOf(v).trim();
+            }
+        }
+        return null;
+    }
+
+    private static boolean isMainAction(String v) {
+        if (v == null || v.isEmpty()) {
+            return false;
+        }
+        return "android.intent.action.MAIN".equals(v)
+                || v.endsWith(".action.MAIN")
+                || "MAIN".equals(v);
+    }
+
+    private static boolean isLauncherCategory(String v) {
+        if (v == null || v.isEmpty()) {
+            return false;
+        }
+        return "android.intent.category.LAUNCHER".equals(v)
+                || "android.intent.category.LEANBACK_LAUNCHER".equals(v)
+                || v.endsWith(".category.LAUNCHER")
+                || v.endsWith(".category.LEANBACK_LAUNCHER")
+                || "LAUNCHER".equals(v)
+                || "LEANBACK_LAUNCHER".equals(v);
+    }
+
+    /**
+     * Raw {@code android:name} values from Application / Activity / Service /
+     * Receiver / Provider (and activity-alias). Relative names are not resolved
+     * here — see {@link BusinessPrefixDiscovery#resolveManifestClassName}.
+     */
+    static List<String> listComponentClassNames(File manifest) {
+        LinkedHashSet<String> names = new LinkedHashSet<>();
+        if (manifest == null || !manifest.isFile()) {
+            return new ArrayList<>();
+        }
+        try {
+            byte[] data = Files.readAllBytes(manifest.toPath());
+            AxmlParser parser = new AxmlParser(data);
+            while (parser.next() != AxmlParser.END_FILE) {
+                if (parser.getAttrCount() == 0) {
+                    continue;
+                }
+                String tag = parser.getName();
+                if (tag == null) {
+                    continue;
+                }
+                String lower = tag.toLowerCase(Locale.ROOT);
+                if (!COMPONENT_TAGS.contains(lower)) {
+                    continue;
+                }
+                for (int i = 0; i < parser.getAttrCount(); i++) {
+                    if ("name".equals(parser.getAttrName(i))) {
+                        Object v = parser.getAttrValue(i);
+                        if (v != null) {
+                            String s = String.valueOf(v).trim();
+                            if (!s.isEmpty()) {
+                                names.add(s);
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("WARN: manifest component scan failed: " + e.getMessage());
+        }
+        return new ArrayList<>(names);
     }
 }

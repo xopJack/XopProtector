@@ -437,62 +437,79 @@ static void detect_timing_anomaly() {
 
 // ── Original detection (retained & enhanced) ────────────────────────
 
-static bool maps_has_frida() {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
-    char line[512];
-    bool found = false;
-    while (fgets(line, sizeof(line), fp) != nullptr) {
-        if (strstr(line, OBSC_DECODE("\x3c\x33\x05\x6f\x57")) != nullptr // frida
-            || strstr(line, OBSC_DECODE("\x3d\x34\x01\x26\x5c\xae")) != nullptr // gum-js
-            || strstr(line, OBSC_DECODE("\x36\x28\x02\x61\x53\xbe\x8c\x88\xf0")) != nullptr // linjector
-            || strstr(line, OBSC_DECODE("\x3c\x33\x05\x6f\x57\xf0\x99\x80\xe7\xc7\x20")) != nullptr // frida-agent
-            || strstr(line, "frida-gadget") != nullptr
-            || strstr(line, "re.frida.server") != nullptr) {
-            found = true;
-            break;
-        }
-    }
-    fclose(fp);
-    return found;
+/** Startup / UI path: keep /proc scans bounded (desktop HarmonyOS unix tables are huge). */
+constexpr int kMapsLinesFast = 4096;
+constexpr int kMapsLinesFull = 16384;
+constexpr int kUnixLinesFull = 8192;
+constexpr int64_t kUnixBudgetNsFull = 50LL * 1000 * 1000; // 50 ms
+
+static int64_t mono_ns() {
+    struct timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000000000LL
+            + static_cast<int64_t>(ts.tv_nsec);
 }
 
-/** Common native hook frameworks (maps basename hits). */
-static bool maps_has_hook_framework() {
+/** One /proc/self/maps pass for Frida markers and common hook frameworks. */
+struct MapsHookHits {
+    bool frida = false;
+    bool hook_framework = false;
+};
+
+static MapsHookHits maps_scan_hooks(int max_lines) {
+    MapsHookHits hits;
     FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
+    if (!fp) return hits;
     char line[512];
-    bool found = false;
+    int lines = 0;
     while (fgets(line, sizeof(line), fp) != nullptr) {
-        if (strstr(line, "libsubstrate")
-            || strstr(line, "libsandhook")
-            || strstr(line, "libepic.so")
-            || strstr(line, "libyahfa")
-            || strstr(line, "libwhale.")
-            || strstr(line, "liband64inlinehook")
-            || strstr(line, "libhookzz")
-            || strstr(line, "libxhook.so")) {
-            found = true;
-            break;
+        if (++lines > max_lines) break;
+        if (!hits.frida) {
+            if (strstr(line, OBSC_DECODE("\x3c\x33\x05\x6f\x57")) != nullptr // frida
+                || strstr(line, OBSC_DECODE("\x3d\x34\x01\x26\x5c\xae")) != nullptr // gum-js
+                || strstr(line, OBSC_DECODE("\x36\x28\x02\x61\x53\xbe\x8c\x88\xf0")) != nullptr // linjector
+                || strstr(line, OBSC_DECODE("\x3c\x33\x05\x6f\x57\xf0\x99\x80\xe7\xc7\x20")) != nullptr // frida-agent
+                || strstr(line, "frida-gadget") != nullptr
+                || strstr(line, "re.frida.server") != nullptr) {
+                hits.frida = true;
+            }
         }
-        // Standalone libbhook.so is suspicious (ours is static-linked).
-        if (strstr(line, "libbhook.so") != nullptr) {
-            found = true;
-            break;
+        if (!hits.hook_framework) {
+            if (strstr(line, "libsubstrate")
+                || strstr(line, "libsandhook")
+                || strstr(line, "libepic.so")
+                || strstr(line, "libyahfa")
+                || strstr(line, "libwhale.")
+                || strstr(line, "liband64inlinehook")
+                || strstr(line, "libhookzz")
+                || strstr(line, "libxhook.so")
+                // Standalone libbhook.so is suspicious (ours is static-linked).
+                || strstr(line, "libbhook.so")) {
+                hits.hook_framework = true;
+            }
         }
+        if (hits.frida && hits.hook_framework) break;
     }
     fclose(fp);
-    return found;
+    return hits;
 }
 
-/** Frida often exposes abstract unix sockets; scan /proc/net/unix. */
-static bool frida_unix_socket_hits() {
+/**
+ * Frida often exposes abstract unix sockets; scan /proc/net/unix.
+ * Always bounded — desktop AOSP forks can have enormous socket tables that
+ * would ANR the main thread if scanned unbounded during attachBaseContext.
+ */
+static bool frida_unix_socket_hits(int max_lines, int64_t budget_ns) {
     FILE* fp = fopen("/proc/net/unix", "r");
     if (!fp) return false;
     char line[512];
     bool found = false;
-    (void)fgets(line, sizeof(line), fp);
+    (void)fgets(line, sizeof(line), fp); // header
+    const int64_t deadline = mono_ns() + budget_ns;
+    int lines = 0;
     while (fgets(line, sizeof(line), fp)) {
+        if (++lines > max_lines) break;
+        if ((lines & 63) == 0 && mono_ns() >= deadline) break;
         if (strstr(line, "frida") || strstr(line, "gum-js")) {
             found = true;
             break;
@@ -590,32 +607,51 @@ static int frida_thread_hits() {
     return hits;
 }
 
-static void detect_frida() {
+enum class FridaScanDepth {
+    Fast,  // pre-decrypt main thread: maps+threads+fd+libc; no port/unix
+    Light, // post-hook / verifySignature: maps+libc only
+    Full,  // background thread: port + unix + everything
+};
+
+static void detect_frida(FridaScanDepth depth) {
     PROTECTOR_BCF_SINK();
+    const int maps_limit = (depth == FridaScanDepth::Full) ? kMapsLinesFull : kMapsLinesFast;
     int score = 0;
-    if (PROTECTOR_BCF_ALWAYS() && frida_port_open()) {
+
+    // Port connect can stall on some ROMs; keep it off the startup path.
+    if (depth == FridaScanDepth::Full && PROTECTOR_BCF_ALWAYS() && frida_port_open()) {
         PLOGD("frida port open");
         CRASH_SEGV("frida_port");
         return;
     }
-    if (maps_has_frida()) {
+
+    const MapsHookHits maps = maps_scan_hooks(maps_limit);
+    if (maps.frida) {
         PLOGD("frida so/maps hit");
         CRASH_SEGV("frida_maps");
+        return;
+    }
+    if (maps.hook_framework) {
+        PLOGD("hook framework in maps");
+        CRASH_SEGV("hook_framework");
         return;
     }
     if (PROTECTOR_BCF_NEVER()) {
         score = 99;
     }
-    if (frida_unix_socket_hits()) score += 2;
-    if (frida_tmp_files()) score += 1;
-    int thr = frida_thread_hits();
-    if (thr >= 1) score += thr;
-    if (frida_fd_hits()) score += 2;
-    if (maps_has_hook_framework()) {
-        PLOGD("hook framework in maps");
-        CRASH_SEGV("hook_framework");
-        return;
+
+    if (depth == FridaScanDepth::Full
+            && frida_unix_socket_hits(kUnixLinesFull, kUnixBudgetNsFull)) {
+        score += 2;
     }
+
+    if (depth != FridaScanDepth::Light) {
+        if (frida_tmp_files()) score += 1;
+        int thr = frida_thread_hits();
+        if (thr >= 1) score += thr;
+        if (frida_fd_hits()) score += 2;
+    }
+
     int hook_score = libc_hook_score();
     if (hook_score >= 2) {
         PLOGD("libc inline-hook score=%d", hook_score);
@@ -633,11 +669,20 @@ static void detect_frida() {
 void scan_hooks_and_frida_now() {
     int flags = runtime_state().config.risk_flags.load(std::memory_order_relaxed);
     if ((flags & FLAG_DISABLE_FRIDA_DETECT) == 0) {
-        detect_frida();
+        detect_frida(FridaScanDepth::Fast);
     }
     if ((flags & FLAG_DISABLE_CRC_DETECT) == 0) {
         // libc .text CRC defined below — call via forward; verify later in thread if not ready
     }
+    so_guard_check();
+}
+
+void scan_hooks_and_frida_light() {
+    int flags = runtime_state().config.risk_flags.load(std::memory_order_relaxed);
+    if ((flags & FLAG_DISABLE_FRIDA_DETECT) == 0) {
+        detect_frida(FridaScanDepth::Light);
+    }
+    // HMAC only path is still covered: so_guard_check is cheap when maps are capped.
     so_guard_check();
 }
 
@@ -957,7 +1002,7 @@ static void* risk_thread_main(void*) {
         }
 
         if (need_frida) {
-            detect_frida();
+            detect_frida(FridaScanDepth::Full);
         }
         if (need_crc) {
             verify_libc_text_crc();

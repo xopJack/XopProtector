@@ -1,5 +1,118 @@
 # Changelog
 
+## 0.8.6
+
+- **Default: encrypt Manifest Application (+ LAUNCHER)** — `--startup-plain`
+  default flipped to **OFF** (was ON since 0.8.3). Opt in with `--startup-plain`
+  for install-AOT / faster splash. `--startup-plain-app-leaf` no longer
+  auto-ON under `--profile perf` (default OFF; opt in explicitly).
+- **SO load on Android 16 / PAC:** do not hook linker `call_constructors`
+  (that hook zeroed `.init_array`, including plaintext `libmmkv`). Keyed loads
+  use `so_plain` when executable, otherwise mmap-only L2e. No memfd.
+- Desktop / installer / packer jar version **0.8.6**.
+
+## 0.8.5
+
+- **Batch-1 Splash / Baidu-like root DEX (no P2):**
+  - `--profile perf`: **narrow class-split** — no `applicationId` / parent /
+    cluster prefix encrypt; only Manifest exact types, `--hollow-prefix`,
+    payment/industry True-VMP, `--true-vmp-prefix`. Discovery parent+cluster
+    forced off under PERF.
+  - `--startup-plain-app-leaf` / `--no-…`: keep Manifest Application **leaf
+    package** plain (`Lcom/a/b/App;` → `Lcom/a/b/`). Default **ON** when
+    profile is `perf`, else OFF.
+- Desktop / installer / packer jar version **0.8.5**.
+
+## 0.8.4
+
+- **Cold-start (no P2 / DexMerger still sync before splash):**
+  - Defer `finishBusinessSoDecrypt`, `enableJunkVerify`, and
+    `DexScanCompat.install` to **first UI frame** (same
+    `DeferredSoHooksInstaller` path as business-SO dlopen hooks). Prefetch
+    facade still overlaps dex2oat during merge.
+  - Timing logs: `initApp` / `DexMerger.merge` / deferred post-frame work.
+- **Startup-plain:**
+  - LAUNCHER scan: MAIN + LAUNCHER/LEANBACK in the **same** intent-filter;
+    tolerate `android:` attr prefixes; accept LEANBACK_LAUNCHER.
+  - Auto leaf-prefix from LAUNCHER activity parent package (≥3 segments), so
+    splash/welcome siblings stay install-AOT without `--startup-plain-prefix`.
+- Desktop / installer / packer jar / native version **0.8.4**.
+
+## 0.8.3
+
+- **P0 startup merge (Baidu-like cold path, keep hybrid precision):**
+  - Manifest **Application** + **MAIN/LAUNCHER** activities (and alias
+    `targetActivity`) forced **startup-plain** — stay in APK-root DEX for
+    install AOT; never enter `dexes.zip`. CLI: `--startup-plain` /
+    `--no-startup-plain` (default ON). Logs `Startup-plain types`.
+  - Default `--so-decrypt-mode` → **lazy** (was eager) for faster splash.
+- **P1:** `--startup-plain-prefix <desc>` (repeatable) keeps extra packages
+  plain (e.g. `Lcom/ideack/notes/ui/activity/`). Prefixes with &lt;3 path
+  segments rejected. Works even with `--no-startup-plain`.
+- Desktop / installer / packer jar version **0.8.3**.
+
+## 0.8.2
+
+- Manifest business discovery (rename-safe, ad-safe):
+  - **Application** may define the business root even when outside
+    `applicationId` vendor (`manifest-app-leaf` / exact type). Cross-vendor
+    leaf requires ≥3 path segments + min class count; deny/SDK still skipped.
+  - Trusted components (same `applicationId` vendor **or** under Application
+    **leaf** package, e.g. `Lcom/c/d/` — not company-wide `Lcom/c/`):
+    **exact type + leaf package**.
+  - Known ad/SDK Manifest components: **skipped entirely** (no exact, no leaf).
+  - Ambiguous cross-package components: never package prefix; **exact by
+    default** (`--manifest-ambiguous-exact`, default on) so Manifest business
+    Activities encrypt even without a custom Application.
+  - Cross-vendor leaf promotions capped (`MAX_CROSS_VENDOR_LEAVES`); cap also
+    enforced for component leaves (exact still added when capped).
+  - DEX package clustering still gated by `applicationId` vendor root.
+- CLI: `--manifest-app-cross-vendor-leaf` / `--manifest-business-exact` /
+  `--manifest-ambiguous-exact` (and `--no-…` forms).
+- `DexLayout.Context.businessExactTypes` + inner-class match in
+  `isBusinessType`.
+- Desktop / installer / packer jar version **0.8.2**.
+
+## 0.8.1
+
+- Class-split business discovery (beyond bare `applicationId`):
+  - Always scan Manifest **Activity / Service / Receiver / Provider / Application**
+    `android:name` → package-prefix union.
+  - Default **one-level parent** of applicationId (`com.foo.bar.app` → also
+    `Lcom/foo/bar/`; never company-root `Lcom/foo/`). CLI:
+    `--no-business-parent-prefix`.
+  - Default **non-SDK DEX package clustering** (min classes via
+    `--business-discover-min-classes`, default 8). CLI:
+    `--no-business-auto-discover`.
+- Discovery safety: Manifest/cluster prefixes must sit under the app **vendor
+  root** (first two package segments, e.g. `Lcom/ideack/`); SDK + known ad
+  obfuscation namespaces (`byazt` / Pangle / GDT / …) are denied. Fixes crash
+  when ad Activities were class-split as business.
+- SAFE/MAX SO skip: Pangle/CSJ/GroMore native libs (`libpangle*`, `libtt_*`,
+  `libPgl*`, `libavmdl*`, `libumeng*`, …) — encrypting them SIGSEGVs on plugin
+  `loadLibrary`.
+- Desktop / installer / packer jar version **0.8.1**.
+
+## 0.8.0
+
+- DEX packing **always class-splits** by `DexLayout.isBusinessType` (applicationId
+  prefix, `--hollow-prefix`, payment / industry / true-VMP rules): matching classes
+  go into encrypted `dexes.zip` (then hollow / VMP); non-business classes stay in
+  the APK root for install-time AOT. DexMerger prepends the extract at runtime.
+- Mixed DEX plain side **strips** business classes when safe. If the plain set
+  contains DexPool-fragile packages (e.g. `Landroidx/compose/`), that file keeps
+  the **original** root DEX (`KEEP_FULL_UNPROTECTED`) — business types may still
+  appear in the APK root for that file; logs/WARN mark it. Do **not** treat those
+  files as “extracted / thinned / business removed”.
+- Pure business DEX: no root copy. Pure non-business: original bytes (no DexPool).
+- `--dex-layout` deprecated (legacy values ignored with a warning).
+- Parallel DEX load: each worker uses `oat/p{i}/`; serial fallback uses
+  `oat/serial/` so timeout/`shutdownNow` cannot race dex2oat on the same dir.
+- Warn when class-split extracts **0** business classes (applicationId prefix
+  often narrower than real code namespaces — use `--hollow-prefix`).
+- Lazy SO decrypt cold-start improvements retained.
+- Desktop / installer / packer jar version **0.8.0**.
+
 ## 0.7.9
 
 - Installer: ship apphost as `XopProtectorApp.exe` (shortcuts launch it). Avoids

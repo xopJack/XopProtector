@@ -1,332 +1,157 @@
-# XopProtector
+# XopProtector（XOP 加固平台）
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[中文说明](README.zh-CN.md)
+[English](README.en.md)
 
-Monorepo for an Android APK protector: build-time packer (JVM + Windows desktop) and
-on-device native shell (`libprotector.so`) with DEX encryption, dual VMP, SO protect, and RASP.
+Android APK 加固 monorepo：构建期打包引擎（JVM CLI + Windows 桌面端）与设备端原生壳
+（`libprotector.so`），提供 DEX 加密、双 VMP、SO 保护与 RASP。
 
-> **Disclaimer:** Protection raises the cost of reverse engineering; it does **not** make
-> an app unbreakable. Use only to protect software you are authorized to distribute.
-> Do not use this project to conceal malware.
+> **免责声明：** 加固只能提高逆向成本，**不能**保证应用不可破解。请仅用于保护您有权分发的软件，
+> 禁止用于隐藏恶意软件。
 
-**Security contact:** `xopJack@163.com` — see [SECURITY.md](SECURITY.md).
+**安全联系邮箱：** `xopJack@163.com` — 详见 [SECURITY.md](SECURITY.md)。  
+快速解决问题可加V:<span style="color:#000000">wnchjy168</span>
 
-## Quick start
+## 快速开始
 
-### Try the Windows desktop build first (recommended)
+### 先试用 Windows 桌面端（推荐）
 
-If you only want to use the tool, download the latest Windows package from
-**[Releases](https://github.com/xopJack/XopProtector/releases)**
-(e.g. `XopProtector-*-win-x64.zip` or the Setup installer):
+若不打算改源码，可直接从 GitHub **[Releases](https://github.com/xopJack/XopProtector/releases)** 下载最新的 Windows 包（如 `XopProtector-*-win-x64.zip` 或 Setup 安装包）：
 
-1. Download, extract, then run `XopProtector.exe`
+1. 下载，解压后运行 `XopProtector.exe`
 
-The desktop build ships with the packer engine; no Android SDK / NDK / .NET setup is required.
+桌面端已自带加固引擎；无需自行配置 Android SDK / NDK / .NET。
 
-Build from source only if you need to modify the code or contribute — see below.
+需要从源码编译、改功能或参与贡献时，再按下面步骤操作。
 
-### 0) Configure Android SDK (required)
+### 0）配置 Android SDK（必做）
 
-Edit `local.properties` at the repo root and set `sdk.dir` to **your** Android SDK path before building:
+打开仓库根目录的 `local.properties`，把 `sdk.dir` 改成**你本机** Android SDK 路径后再编译：
 
 ```properties
-# Windows example (escape backslashes)
+# Windows 示例（反斜杠需转义）
 sdk.dir=D\:\\Android\\Sdk
 ```
 
-You may skip editing the file and use `ANDROID_HOME` / `ANDROID_SDK_ROOT` instead.
+也可不改该文件，改用环境变量 `ANDROID_HOME` / `ANDROID_SDK_ROOT`。
 
-### Prerequisites
+### 环境要求
 
-| Tool | Purpose |
-|------|---------|
-| JDK 17+ | Packer jar / Gradle |
-| Android SDK + NDK | `:native`, `:demo`, `exportShellFiles` |
-| .NET SDK 7+ (optional) | Windows desktop UI |
+| 工具 | 用途 |
+|------|------|
+| JDK 17+ | Packer / Gradle |
+| Android SDK + NDK | `:native`、`:demo`、`exportShellFiles` |
+| .NET SDK 7+（可选） | Windows 桌面端 |
 
-Set `ANDROID_HOME` or `ANDROID_SDK_ROOT` (or edit `local.properties` as above). On Windows, prefer `gradlew.bat`.
+请设置 `ANDROID_HOME` 或 `ANDROID_SDK_ROOT`（或按上面写好 `local.properties`）。Windows 下推荐使用 `gradlew.bat`。
 
-### 1) Build packer + shell
+### 1）编译 packer 与壳文件
 
 ```bat
 gradlew.bat :packer:jar
 gradlew.bat exportShellFiles
 ```
 
-Shell files land under `executable/shell-files/` (gitignored; generated locally).
+壳产物输出到 `executable/shell-files/`（已被 gitignore，需本地生成）。
 
-### 2) Protect the demo APK
+### 2）加固 demo APK
 
 ```bat
 gradlew.bat :demo:assembleRelease
 gradlew.bat protectDemo
 ```
 
-Or run the packer CLI against any APK:
+或对任意 APK 调用 CLI：
 
 ```bat
 java -jar packer\build\libs\protector-packer-*.jar app.apk -o out.apk ^
   --shell-dir executable\shell-files
 ```
 
-### 3) Windows desktop (optional)
+### 3）Windows 桌面端（可选）
 
 ```bat
 cd desktop
 dotnet run --project Protector.Desktop
 ```
 
-Portable release folder + optional installer:
+生成便携目录 / 安装包：
 
 ```bat
 powershell -ExecutionPolicy Bypass -File scripts\release-desktop.ps1
 ```
 
-More detail: [Windows desktop](#windows-desktop-xoprotector) · [CONTRIBUTING.md](CONTRIBUTING.md)
+更多说明见英文 README 的 [Windows desktop](README.en.md#windows-desktop-xoprotector) 与 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
-## Modules
-- `:native` — C++ runtime (hook/patch/PVM2 interpret) + thin Java shell (`ProxyApplication`)
-- `:demo` — sample app + `libdemo_biz.so` for `--protect-so` smoke
-- `:packer` — JVM packer library + CLI jar (build-time; **not** an Android AAR)
-- `desktop/` — Windows WPF UI that runs the packer as a **subprocess**
+## 模块
 
-| Layer | Runs on | Role |
-|-------|---------|------|
-| Packer / Desktop | Windows / CI (JVM + .NET) | Protect an APK before release |
-| Native shell | Android device (inside protected APK) | Decrypt / restore / interpret / RASP |
+| 模块 | 说明 |
+|------|------|
+| `:native` | C++ 运行时（hook / 还原 / PVM2 解释）+ Java 壳 |
+| `:demo` | 示例应用 + `libdemo_biz.so`（SO 保护冒烟） |
+| `:packer` | JVM 打包库与 CLI jar（非 Android AAR） |
+| `desktop/` | Windows WPF 界面，子进程调用 packer |
 
-## License
+| 层级 | 运行位置 | 作用 |
+|------|----------|------|
+| Packer / Desktop | Windows / CI | 发布前加固 APK |
+| Native shell | Android 设备 | 解密 / 还原 / 解释执行 / RASP |
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security reports: [SECURITY.md](SECURITY.md) (`xopJack@163.com`).
+## 能力概览
 
-## Capability summary
-| Milestone | Capability |
-|-----------|------------|
-| M1 | PDX1 dexes.zip, plaintext-window shrink, configurable RASP |
-| M2 | SO self-guard, Frida/Hook scans, threat reports |
-| M3 | **PVM1 method packing** (`--vmp-prefix`), optional business SO `.text` RC4 (`--protect-so`) |
-| PVM2 | **True VMP** (`--true-vmp-prefix`): morph + multi-ISA + float/double/monitor ISA (v4) + RASP gate + interpret cache |
-| Perf P0 | Class-batch hollow restore + startup DEX RW hold (done) |
-| Perf P1 | Parallel file prepatch before ART map (done) |
-| Perf P2 | Cold-start decrypt→extract pipeline (no plaintext zip); warm skip code.bin re-copy; async SO decrypt |
+| 里程碑 | 能力 |
+|--------|------|
+| M1 | PDX1 DEX 加密、明文窗口收缩、可配置 RASP |
+| M2 | SO 自守护、Frida/Hook 扫描、威胁上报 |
+| M3 | PVM1 方法打包、业务 SO `.text` RC4（默认开） |
+| PVM2 | 真 VMP（morph + 多 ISA + 浮点/monitor 等） |
+| Perf | 冷启动解密管线、预修补、SO 异步解密等 |
 
-> **Note on “VMP”:**
-> - `--vmp-prefix` = **PVM1** virtualized packing (unpack → write Dalvik). Not an interpreter.
-> - `--true-vmp-prefix` = **PVM2** true VMP (JNI trampoline + native interpret).
+**VMP 含义：**
 
-## Docs
-- `doc/pvm2-mvp.md` / `doc/pvm2-phase2.md` / `doc/pvm2-phase3.md` / `doc/pvm2-phase4.md`
-- `doc/industry-profile.md` — `--profile industry` (tools / industrial apps)
-- `CHANGELOG.md`
-- [README.zh-CN.md](README.zh-CN.md) — Chinese overview + quick start
-- [.github/RELEASE_TEMPLATE.md](.github/RELEASE_TEMPLATE.md) — GitHub Release body template
+- `--vmp-prefix` → **PVM1**（解码后写回 Dalvik，不是解释器）
+- `--true-vmp-prefix` → **PVM2**（JNI 跳板 + 原生解释，不写回 DEX）
 
-## Library API (packer)
-Programmatic entry (same code as the CLI):
+默认策略偏「加密优先」：全量 DEX 加密，不全包抽空；支付 / 行业可自动 True-VMP。
+详见 `doc/industry-profile.md`、`doc/auto-true-vmp-contract.md`。
 
-```java
-ProtectOptions opts = new ProtectOptions();
-opts.inputApk = new File("app.apk");
-opts.outputApk = new File("out.apk");
-opts.shellDir = new File("executable/shell-files");
-ProtectResult result = new Protector().protect(opts);
-```
+## 常用 CLI
 
-CLI adds `--json-progress` for NDJSON phase/log/done/error events (used by the desktop UI).
-
-## Windows desktop (XopProtector)
-
-Windows WPF client that drives the packer as a local subprocess. End users run a self-contained
-`XopProtector.exe` (or the Setup installer); no system .NET runtime or JDK is required when the
-release is built with the bundled jlink JRE.
-
-UI languages: **English** (default resource) and **Simplified Chinese**. Follows the OS language unless
-overridden under **Settings → Language** (restart required). Themes: **Dark** (default) and **Light**.
-Preferences are stored in `%AppData%\XopProtector\settings.json` (legacy `%AppData%\XOP Protector` / `AppShield` is migrated on first launch).
-
-### Prerequisites (build from source)
-
-| Dependency | Purpose |
-|------------|---------|
-| [.NET SDK 7+](https://dotnet.microsoft.com/download) | Build / publish the WPF app |
-| JDK 17+ (`JAVA_HOME`, with `jlink`) | Packer jar + optional bundled runtime |
-| Android NDK (via Gradle) | Native shell (`exportShellFiles`) |
-| [Inno Setup 6](https://jrsoftware.org/isdl.php) (optional) | Windows Setup `.exe` installer |
-
-### Development
+完整参数列表见 [README.en.md — Packer options](README.en.md#packer-options)。常用示例：
 
 ```bat
-gradlew.bat :packer:jar
-gradlew.bat exportShellFiles
-cd desktop
-dotnet run --project Protector.Desktop
-```
-
-Release configuration:
-
-```bat
-cd desktop
-dotnet run --project Protector.Desktop -c Release
-```
-
-At runtime the UI resolves the packer engine in this order:
-
-1. `PROTECTOR_ENGINE_HOME`
-2. `engine\` next to `XopProtector.exe`
-3. Repository `packer\build\libs` + `executable\shell-files` (requires `java` on `PATH`)
-
-### Build portable `.exe` (recommended)
-
-Produces a self-contained folder under `dist\XopProtector\` including `XopProtector.exe` and the
-local packer engine. From the repository root:
-
-```bat
-powershell -ExecutionPolicy Bypass -File scripts\release-desktop.ps1
-```
-
-This script:
-
-1. Builds `protector-packer-*.jar`
-2. Exports shell files (`exportShellFiles`)
-3. Publishes the WPF app (`dotnet publish`, `win-x64`, self-contained)
-4. Assembles `dist\XopProtector\`
-5. Bundles a minimal JRE via `jlink` into `engine\runtime\`
-6. Builds the Inno Setup installer when ISCC is available
-
-**Optional flags**
-
-| Flag | Effect |
-|------|--------|
-| `-SkipNativeShell` | Reuse existing `executable\shell-files` |
-| `-SkipJlink` | Do not bundle JRE (machine must have JDK at runtime) |
-| `-SkipInstaller` | Skip Setup `.exe`; only emit the portable folder |
-
-Example (portable folder only, no installer):
-
-```bat
-powershell -ExecutionPolicy Bypass -File scripts\release-desktop.ps1 -SkipInstaller
-```
-
-**Output layout**
-
-```
-dist/XopProtector/
-  XopProtector.exe           # main application
-  *.dll / *.json / …         # .NET self-contained runtime
-  engine/
-    runtime/                 # jlink JRE (omit if -SkipJlink)
-    protector-packer.jar
-    shell-files/
-dist/XopProtector-Setup-<ver>.exe   # Windows installer (if Inno Setup is installed)
-```
-
-Ship either the whole `dist\XopProtector\` folder (portable) or the Setup executable.
-
-### Build Windows installer (Setup `.exe`)
-
-Prerequisite: [Inno Setup 6](https://jrsoftware.org/isdl.php) and an assembled `dist\XopProtector\`.
-
-```bat
-powershell -ExecutionPolicy Bypass -File scripts\release-desktop.ps1
-```
-
-Or build the installer alone after a prior release:
-
-```bat
-powershell -ExecutionPolicy Bypass -File scripts\build-installer.ps1
-```
-
-Alternatively open `installer\XOP-Protector.iss` in the Inno Setup Compiler and choose **Build**.
-
-Installer defaults:
-
-- Wizard languages: English and Simplified Chinese
-- Install directory: `C:\Program Files\XopProtector\`
-- Desktop shortcut enabled by default
-- Start Menu entry and uninstaller
-- Bundled `engine\` (JRE + packer + shell); end users do not need a system JDK
-
-See also `installer\README.md`.
-
-## `--true-vmp-prefix` (Phase 4)
-- Phase 3 ISA + parsed-image cache; demo covers invoke/field/array/catch + `soProbe` → protected SO.
-
-## `--protect-so` / `--no-protect-so` / `--protect-so-mode`
-- **Default ON** (0.6.8+): RC4-encrypt safe business `lib/*.so` `.text`.
-- Pass `--no-protect-so` to disable. `--protect-so` remains as an explicit enable.
-- **`--protect-so-mode safe`** (default, 0.6.12+): industry/reloc skips **plus** a
-  size budget (default 12MB extra / skip files &gt;8MB unpacked) so large engines
-  do not inflate the APK by tens of MB.
-- **`--protect-so-mode aggressive`**: only shell + text-reloc skips; still applies
-  soft size-budget truncate with WARN.
-- **`--protect-so-mode max`**: industry skips, **no** size budget (encrypt every eligible SO).
-- `--protect-so-budget-mb` / `--protect-so-max-file-mb` / `--protect-so-abi` override defaults.
-- **`--so-decrypt-mode eager|lazy`** (default **eager**): cold-start decrypt timing.
-  Eager = full `so_plain` materialize + preload all keyed. Lazy = skip full
-  materialize; preload only mirrors already in `so_plain`; decrypt on first
-  `dlopen` (keyed `DT_NEEDED` closure); background-fill remaining keyed SOs and
-  write `so_plain_ready` for the next warm start.
-  Missing `so_decrypt_mode` in old `config.json` → eager.
-- Prefer `System.loadLibrary` **after** `Application` / shell bootstrap.
-- Early `dlopen` hooks are installed in the SO constructor; loads before `sokeys.bin` are queued and decrypted when keys arrive.
-- Packer **skips** SOs whose dynamic relocs patch `.text` (would break after encrypt).
-- Runtime uses ELF `load_bias = map_start - first_PT_LOAD.p_vaddr` for decrypt.
-- Demo: `libdemo_biz.so` (`Business.nativeAddRaw` / `soProbe`).
-- After pack: `size_report` on stdout and `<outDir>/Log/<out>-size_report.json`.
-
-## Build / release
-```bat
-gradlew.bat protectDemo
-powershell -File scripts\release-demo.ps1 -Serial <deviceSerial>
-```
-
-```bat
-java -jar packer/build/libs/protector-packer-*.jar app.apk -o out.apk ^
-  --shell-dir executable/shell-files ^
-  --true-vmp-prefix Lcom/yqsh/protectordemo/Business; ^
+java -jar packer\build\libs\protector-packer-*.jar app.apk -o out.apk ^
+  --shell-dir executable\shell-files ^
+  --profile balanced ^
   --protect-so
 ```
 
-## Packer options
-```
---profile <name>           hollow/VMP: balanced (default) | industry | aggressive | perf | max
---hollow-prefix <desc>     allowlist type prefix (repeatable; disables auto include)
---vmp-prefix <desc>        PVM1-pack methods under type prefix (repeatable)
---true-vmp-prefix <desc>   PVM2 true VMP under type prefix (repeatable)
---protect-so               RC4-encrypt safe business lib/*.so .text (default ON)
---no-protect-so            disable business SO .text encryption
---encrypt-assets           PAS1+AES-GCM encrypt assets/** → protector/aenc (default OFF)
---no-encrypt-assets        disable assets encryption
---enable-res-protect       shorten res/ paths + rewrite resources.arsc (default OFF)
---detect-proxy             enable NetGuard proxy/VPN heuristics (default OFF)
---pin-certs <file>         leaf cert SHA-256 pins for NetGuard TrustManager wrapper
---channel <name>           stamp Walle-compatible channel after sign (needs --keystore)
---channels <file>          batch stamp → <out>-<channel>.apk (needs --keystore)
---protect-so-mode <m>      safe (default) | aggressive | max
---protect-so-budget-mb <n> SO protect size budget MB (default 12; max ignores)
---protect-so-max-file-mb <n> skip SO if unpacked >N MB (default 8; max ignores)
---protect-so-abi <abi>|all only select basenames present under ABI (default all)
---so-decrypt-mode <m>      eager (default)=full SO materialize+preload at cold start;
-                           lazy=on-demand + background fill → so_plain_ready warm reuse
---json-progress            NDJSON progress on stdout (desktop UI)
---risk-flags / --rasp-action / --report-enabled
+SO 冷启动解密时机（默认 eager）：`--so-decrypt-mode eager|lazy`。
+lazy：跳过全量 materialize；preload 只 pin 已有 `so_plain`；其余 dlopen 按需解密；
+后台补齐剩余 keyed 并写 `so_plain_ready`，二次启动走 warm reuse。
+
+行业 / 工具类应用可试：
+
+```bat
+  --profile industry
 ```
 
-### Hollow policy (production default)
-Without `--hollow-prefix`, packer uses a **unified** auto policy (same for every APK):
-- **balanced** / **perf** (default): hollow only the manifest `applicationId` package (skip `*Activity`/…); keeps most code AOT-friendly
-- **aggressive**: skip major SDKs/components; hollow remaining business types
-- **max**: near legacy hollow-all (still skips `Landroid/` + `Landroidx/`)
+## 桌面端
 
-Pass `--hollow-prefix` to restrict to an allowlist (still skips framework + components under balanced/perf).
-Never hard-codes a single customer package name.
+- 语言：英文（默认资源）/ 简体中文；跟随系统，设置里可改（需重启）
+- 主题：深色（默认）/ 浅色
+- 配置目录：`%AppData%\XopProtector\`（旧版 `XOP Protector` / `AppShield` 会在首次启动迁移）
 
-## Assets
-- `code.bin` v4, `dexes.zip` (PDX1), `config.json`, optional `sokeys.bin` / `assets.map` / `netguard.json`
-- Optional `--encrypt-assets`: `protector/aenc/*` (PAS1); read via `ProtectorAssets`
-- Optional `--enable-res-protect`: shorten `res/` paths (see `doc/res-protect.md`)
-- Optional `--detect-proxy` / `--pin-certs`: `NetGuard` (see `doc/netguard.md`)
-- Optional `--channel` / `--channels`: signing-block channel (see `doc/channel.md`)
-- Phase 7 native CFF/BCF: source-level default; LLVM via `-Pprotector.llvmObf` (see `doc/llvm-obfuscation.md`)
-- `libprotector.so` keys: INSN / DEX / ASSETS / UNKNOWN / HMAC
+发版模板：[.github/RELEASE_TEMPLATE.md](.github/RELEASE_TEMPLATE.md)
+
+## 许可证与贡献
+
+- 许可证：[Apache License 2.0](LICENSE) · [NOTICE](NOTICE)
+- 贡献：[CONTRIBUTING.md](CONTRIBUTING.md)
+- 安全漏洞：**勿公开提 Issue**，走 [SECURITY.md](SECURITY.md) 或邮件 `xopJack@163.com`
+
+## 文档索引
+
+- 英文完整文档：[README.en.md](README.en.md)
+- 变更记录：[CHANGELOG.md](CHANGELOG.md)
+- 设计文档：`doc/`（PVM2、assets、渠道、NetGuard、LLVM 混淆等）

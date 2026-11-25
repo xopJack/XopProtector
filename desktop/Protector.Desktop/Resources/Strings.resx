@@ -19,6 +19,11 @@
   <data name="Nav_HistorySub" xml:space="preserve"><value>History</value></data>
   <data name="Nav_Reports" xml:space="preserve"><value>Reports</value></data>
   <data name="Nav_ReportsSub" xml:space="preserve"><value>Reports</value></data>
+  <data name="Nav_Hotfix" xml:space="preserve"><value>Hotfix</value></data>
+  <data name="Nav_HotfixSub" xml:space="preserve"><value>Android hotfix framework</value></data>
+  <data name="Msg_OpenUrlFailed" xml:space="preserve"><value>Could not open browser:
+{0}
+{1}</value></data>
   <data name="Nav_Settings" xml:space="preserve"><value>Settings</value></data>
   <data name="Nav_SettingsSub" xml:space="preserve"><value>Settings</value></data>
   <data name="Harden_Cancel" xml:space="preserve"><value>Cancel</value></data>

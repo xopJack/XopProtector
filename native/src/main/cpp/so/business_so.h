@@ -49,7 +49,8 @@ void materialize_decrypted_sos();
 void preload_so_plain();
 
 /**
- * Install linker mmap / call_constructors / openat rewrite only (L2e decrypt).
+ * Install linker mmap / openat rewrite only (L2e decrypt). call_constructors
+ * is not hooked.
  * Safe after sokeys load — does not bytehook_hook_all libc dlopen
  * (that poisons vendor HWUI mapper into clns-*).
  */

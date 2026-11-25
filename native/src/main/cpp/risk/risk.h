@@ -40,8 +40,17 @@ public:
 
 RiskChecker& risk_checker();
 
-/** Run a fast Frida/hook screen on the calling thread (init_app / JNI). */
+/**
+ * Fast Frida/hook screen for the main thread (pre-decrypt gate in init_app).
+ * Skips port probe and /proc/net/unix; background risk thread runs the full scan.
+ */
 void scan_hooks_and_frida_now();
+
+/**
+ * Light post-hook / verifySignature screen: one maps pass + libc prologue check.
+ * Avoids repeating the full fast gate three times on the startup path.
+ */
+void scan_hooks_and_frida_light();
 
 /**
  * Gate for TRUE_VMP interpret(). Returns false when RASP has marked the

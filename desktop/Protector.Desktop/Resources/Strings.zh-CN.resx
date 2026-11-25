@@ -19,6 +19,11 @@
   <data name="Nav_HistorySub" xml:space="preserve"><value>历史</value></data>
   <data name="Nav_Reports" xml:space="preserve"><value>安全报告</value></data>
   <data name="Nav_ReportsSub" xml:space="preserve"><value>报告</value></data>
+  <data name="Nav_Hotfix" xml:space="preserve"><value>热更新</value></data>
+  <data name="Nav_HotfixSub" xml:space="preserve"><value>Android热更新框架</value></data>
+  <data name="Msg_OpenUrlFailed" xml:space="preserve"><value>无法打开浏览器：
+{0}
+{1}</value></data>
   <data name="Nav_Settings" xml:space="preserve"><value>设置</value></data>
   <data name="Nav_SettingsSub" xml:space="preserve"><value>设置</value></data>
   <data name="Harden_Cancel" xml:space="preserve"><value>取消</value></data>

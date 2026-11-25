@@ -71,23 +71,55 @@ target_include_directories(protector PRIVATE
 )
 
 target_compile_options(protector PRIVATE -Wall -Wextra)
+# minSdk 23: shared-lib ELF TLS needs API 29+. Keep emulated TLS so thread_local
+# works on older devices; requires compiler-rt builtins linked below.
+target_compile_options(protector PRIVATE -femulated-tls)
 # Hi-MC field tablets are often pre-ARMv8.3; paciasp/BTI → SIGILL on load.
 # Keep ROP hardening off until we gate by HWCAP_AP at runtime.
 if (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     target_compile_options(protector PRIVATE -mbranch-protection=none)
 endif()
-target_link_options(protector PRIVATE "-Wl,-z,max-page-size=16384")
+target_link_options(protector PRIVATE
+        "-Wl,-z,max-page-size=16384"
+        # NDK allows undefined syms in .so by default; fail at link instead of
+        # UnsatisfiedLinkError (__emutls_get_address) on device.
+        "-Wl,--no-undefined"
+)
 
 find_library(log-lib log)
 find_library(android-lib android)
 find_library(z-lib z)
+find_library(dl-lib dl)
 
-target_link_libraries(protector
+# Pull __emutls_get_address (and other emulated-TLS helpers) into libprotector.so.
+# Query the *target* builtins path — bare --print-libgcc-file-name can return host.
+set(_protector_libgcc_cmd "${CMAKE_CXX_COMPILER}")
+set(_protector_libgcc_args "--print-libgcc-file-name")
+if (CMAKE_CXX_COMPILER_TARGET)
+    list(PREPEND _protector_libgcc_args "--target=${CMAKE_CXX_COMPILER_TARGET}")
+endif()
+execute_process(
+        COMMAND "${_protector_libgcc_cmd}" ${_protector_libgcc_args}
+        OUTPUT_VARIABLE PROTECTOR_COMPILER_RT_BUILTINS
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PROTECTOR_COMPILER_RT_RESULT
+)
+if (NOT PROTECTOR_COMPILER_RT_RESULT EQUAL 0 OR NOT EXISTS "${PROTECTOR_COMPILER_RT_BUILTINS}")
+    message(FATAL_ERROR
+            "Cannot locate compiler-rt builtins (needed for thread_local / __emutls_get_address). "
+            "cmd=${_protector_libgcc_cmd} ${_protector_libgcc_args} "
+            "result=${PROTECTOR_COMPILER_RT_RESULT} out=${PROTECTOR_COMPILER_RT_BUILTINS}")
+endif()
+message(STATUS "compiler-rt builtins: ${PROTECTOR_COMPILER_RT_BUILTINS}")
+
+target_link_libraries(protector PRIVATE
         ${log-lib}
         ${android-lib}
         ${z-lib}
+        ${dl-lib}
         dobby
         bytehook
+        "${PROTECTOR_COMPILER_RT_BUILTINS}"
 )
 
 # Always decrypt .bitcode at load; packer encrypts libprotector.so before packaging.

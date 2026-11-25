@@ -156,9 +156,12 @@ public class ProxyComponentFactory extends AppComponentFactory {
                 NativeLibDirRedirect.patchClassLoader(cl,
                         helper.getAbsolutePath(), packaged);
             }
+            long tMerge = System.currentTimeMillis();
             DexMerger.merge(cl, codeCache);
-            JniBridge.finishBusinessSoDecrypt();
-            JniBridge.enableJunkVerify();
+            Log.i(TAG, "DexMerger.merge done in "
+                    + (System.currentTimeMillis() - tMerge) + "ms");
+            // finishBusinessSoDecrypt / junk / DexScanCompat.install → first UI frame
+            // (ProxyApplication.DeferredSoHooksInstaller). Merge stays sync (no P2).
 
             // Application may not exist yet; try ActivityThread.currentApplication().
             try {

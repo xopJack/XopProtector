@@ -33,6 +33,23 @@ class BusinessSoSystemSonameTest {
     }
 
     @Test
+    void pangleCsjMaparmorSkippedInSafe() throws Exception {
+        assertTrue(BusinessSoProtector.isIndustrySkip("libpanglearmor.so"));
+        assertTrue(BusinessSoProtector.isIndustrySkip("libmaparmor.so"));
+        assertTrue(BusinessSoProtector.isIndustrySkip("libMapArmor.so"));
+        var m = BusinessSoProtector.class.getDeclaredMethod(
+                "skipReason", String.class, BusinessSoProtector.Mode.class);
+        m.setAccessible(true);
+        assertEquals("industry/runtime",
+                m.invoke(null, "libmaparmor.so", BusinessSoProtector.Mode.SAFE));
+        assertEquals(null,
+                m.invoke(null, "libmaparmor.so", BusinessSoProtector.Mode.AGGRESSIVE));
+        // P0 EXACT uses category reason (see BusinessSoIndustryPolicyTest).
+        assertEquals("industry/crash",
+                m.invoke(null, "libcrashsdk.so", BusinessSoProtector.Mode.SAFE));
+    }
+
+    @Test
     void uniAppWeexRuntimeSkippedInAllModes() throws Exception {
         assertTrue(BusinessSoProtector.isUniAppRuntimeSkip("libweexjsb.so"));
         assertTrue(BusinessSoProtector.isUniAppRuntimeSkip("libweexjst.so"));

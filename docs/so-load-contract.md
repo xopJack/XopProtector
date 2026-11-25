@@ -9,7 +9,7 @@ Commercial runtime contract for encrypted business SOs. Strategies are
 |----|------|------|------------------------------|--------------|
 | **L1m** | lib_mirror publish | Writable extract-equivalent under `code_cache/protector/lib_mirror/` | `.../lib_mirror/libX.so` | Hardlink/copy from `so_plain` (same inode as warm cache) |
 | **L1** | Extract plain | Packaged extract dir is writable; plaintext published there after archiving cipher to `so_cipher/` | `/data/app/.../lib/<abi>/libX.so` | Same path (plaintext) |
-| **L2e** | Extract inode + in-memory `.text` decrypt | Every keyed SO whose packaged extract file exists, after L1 misses. Not gated on packer `l2e`. `l2e=true` still means eager-skip disk RC4 and hide that SO from ClassLoader helper dirs. | Linker filename = packaged extract path | Ciphertext on disk; RC4 `.text` after linker `mmap` / before `call_constructors`. Kernel maps path is the stock `/data/app/.../lib/<abi>/libX.so`. Missing extract-inode hooks or a failed file-backed execmod probe refuses the load (FATAL). No memfd fallback: `/memfd:libX.so (deleted)` breaks JNI that trusts the kernel path. |
+| **L2e** | Extract inode + in-memory `.text` decrypt | Every keyed SO whose packaged extract file exists, after L1 misses. Not gated on packer `l2e`. `l2e=true` still means eager-skip disk RC4 and hide that SO from ClassLoader helper dirs. | Linker filename = packaged extract path | Ciphertext on disk; RC4 `.text` inside the linker `mmap` hook before it returns (before relocation and constructors). Kernel maps path is the stock `/data/app/.../lib/<abi>/libX.so`. If the recorded spans already cover `.text` and decrypt fails, that `mmap` is unmapped and returns `MAP_FAILED`. Missing linker `mmap` hook, or a failed file-backed execmod probe, refuses the load (FATAL). `call_constructors` is never hooked. No memfd fallback: `/memfd:libX.so (deleted)` breaks JNI that trusts the kernel path. |
 | **L2** | FD, no extract inode | Packaged extract file is absent. Plaintext from `so_plain` (or memfd copy) | Linker filename is the plaintext path. Userspace `dladdr`/maps/`readlink` spoof to extract when a path is known | `android_dlopen_ext` + `ANDROID_DLEXT_USE_LIBRARY_FD` → **memfd** when `memfd_create` works and the SO is ≤ 16 MiB; else `so_plain` fd. Maps spoof strips a leading `memfd:` so the keyed basename still matches. |
 | **L2b** | `dladdr` rewrite | After L2/L3 maps still show `so_plain` or `/memfd:` | Hooked `dladdr` returns extract/`lib_mirror` path for keyed SOs | Unchanged |
 | **L3** | so_plain path | Fallback when memfd / `android_dlopen_ext` fail | `.../code_cache/protector/so_plain/libX.so` | Same |
@@ -79,10 +79,37 @@ packaged ciphertext. The runtime therefore:
   the same basename is still treated as packaged ciphertext. The decrypt runs
   only after the lowest `PT_LOAD` is the mapped file offset and every `.text`
   page is executable; a partial `mmap` does not mark the basename done.
-  32-bit ABIs do not hook linker `mmap64` (`off64_t` vs `off_t`).
+  The hooked symbol is the linker's own wrapper: `mmap` or `__dl_mmap`
+  (64-bit also `mmap64` / `__dl_mmap64` when that address differs). 32-bit
+  ABIs do not hook linker `mmap64` (`off64_t` vs `off_t`). When that hook
+  is missing and `so_plain` is not executable, preload does not `dlopen`
+  (a plaintext dep would pull packaged ciphertext through `DT_NEEDED`).
 - maps records are read in 4KB chunks and stitched to a newline. The pathname
   is the field after the inode, up to `PATH_MAX`, not a 255-byte `%s`. A long
   applicationId extract path still matches its basename.
+
+### RC4 identity gate (basename ≠ mapping)
+
+A sokey entry is keyed by **basename** only. The same name can appear under a
+foreign plugin tree (e.g. CSJ `pangle_p/.../libmaparmor.so`) while the
+packaged extract also ships that basename. Before any in-memory or on-disk
+RC4 of `.text`, the runtime requires either:
+
+1. **Trusted path** — shell-controlled mapping (`nativeLibraryDir` extract,
+   `so_plain` / `lib_mirror` / `memfd`, `so_cipher`, or `code_cache/protector/…`); or
+2. **Diag meta match** — on-disk `file_size` + `.text` offset/size/`sh_addr`
+   match packer `so_text_diag` (layout only; not plaintext SHA-256, so
+   ciphertext extract still qualifies).
+
+Fail closed: log `identity_gate=…`, skip RC4, and do **not** mark the basename
+decrypted. Maps path selection prefers shell-controlled hits over foreign
+same-basename rows. Packer **SO Industry Compatibility Policy** (SAFE/MAX only)
+is complementary: basename → lowercase → EXACT then PREFIX → `decision=SKIP`
+`reason=industry/{category}` and **no sokey**. Covers ads (`libpangle*`,
+`libmaparmor*`), OEM/cloud push, analytics, and sample-confirmed EXACTs
+(`libcrashsdk.so`, `libxgVipSecurity.so`, `libjutils.so`, …). Wide `libxg` /
+`libj` prefixes stay out of policy. AGGRESSIVE does not apply industry skips.
+The runtime gate remains mandatory and is not replaced by the packer policy.
 
 ## Plaintext warm cache (`so_plain_ready` + DEX `.prepatched`)
 
@@ -148,14 +175,24 @@ selects eager-skip of disk RC4 and hiding the SO from ClassLoader helper
 dirs. Size-only runtime classification is not used on v2 diags — it treated
 `libproj` as a megacore and skipped its eager mirror.
 Application attach loads sokeys and installs hooks only: no full-table
-RC4, SHA-256, `lib_mirror` scan, or keyed pin. When extract-inode hooks
-work, the first `dlopen` of any keyed SO with a packaged extract file maps
-that inode and RC4s `.text` in RAM — a warm `so_plain` does not redirect the
-open onto memfd. That path is taken only after a file-backed execmod probe:
+RC4, SHA-256, `lib_mirror` scan, or keyed pin. L2e maps the packaged inode
+and RC4s `.text` in the linker `mmap` hook before that call returns, so
+relocation and constructors see plaintext. The hook records each `PT_LOAD`
+span and decrypts once those spans cover `.text`; it does not wait for
+`/proc/self/maps` to catch up. `soinfo::call_constructors` is not hooked
+on any device. Dobby on that function zeroes `.init_array` on some OEM
+linkers (Meizu 20 Pro, vivo X200 / PD2405), so even plaintext `libmmkv`
+jumps to `pc=0`. A span set that already covers `.text` and still fails
+decrypt unmaps that mapping and returns `MAP_FAILED`, so the linker does
+not run constructors on ciphertext. If the linker `mmap` hook is missing
+and `so_plain` is not executable (`targetSdk >= 29` on Android 10+), the
+load is refused (FATAL). When `so_plain` is executable and mmap is not
+hooked, the load is L3. No memfd.
+The execmod probe is unchanged:
 `mmap` one page of a packaged extract `.so` `PROT_READ|PROT_EXEC`, then
 `mprotect` it writable. The probe uses a real extract file
 (`apk_data_file`), not an anonymous mapping and not a file created under
-`code_cache`. If hooks are missing or the probe fails, the load is refused
+`code_cache`. If the execmod probe fails, the load is refused
 (FATAL) for every keyed SO that has an extract file. Constructors are not
 run on ciphertext, and the load does not fall through to memfd. A successful
 write restores
@@ -163,8 +200,8 @@ per-page protection from the pre-write snapshot: pages that hold only
 `.text` go back to RX; a page whose original protection included
 `PROT_WRITE` and that also extends outside `.text` keeps that protection.
 If that restore fails after the bytes were written, the basename is latched
-as already-plaintext so a later decrypt does not RC4 it again, and the
-write-failure set still blocks constructors. When `USE_LIBRARY_FD` fails
+as already-plaintext so a later decrypt does not RC4 it again. The
+failed mapping is dropped. When `USE_LIBRARY_FD` fails
 and the app targets API 29 or newer on Android 10+, the load fails closed
 instead of path-loading `so_plain`. Older targets still path-load `so_plain`.
 Packer `l2e=true` megacores always stay on that extract inode

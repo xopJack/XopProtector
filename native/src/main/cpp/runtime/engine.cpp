@@ -975,7 +975,7 @@ PROTECTOR_ENCRYPT void init_app(JNIEnv* env, jclass, jstring protector_dir_j,
     // Install ART hooks before parsing/applying code.bin so DefineClass can patch.
     protector::hook::install_hooks();
     // Split SO hooks:
-    // 1) Early: linker mmap / call_constructors / openat (L2e) — needed before
+    // 1) Early: linker mmap / openat (L2e) — needed before
     //    Application loads keyed SOs; Dobby on linker, not bytehook_hook_all.
     // 2) Late: bytehook_hook_all(dlopen/…) after first UI frame — those rewrite
     //    PLT caller identity and break vendor HWUI mapper into clns-*
@@ -987,8 +987,9 @@ PROTECTOR_ENCRYPT void init_app(JNIEnv* env, jclass, jstring protector_dir_j,
     } else {
         PLOGI("skip business SO hooks (no sokeys / --no-protect-so)");
     }
-    // decrypt_already_loaded_async is deferred until after DexMerger (Java calls
-    // finishBusinessSoDecrypt) so we do not race ART while mapping dexes.
+    // decrypt_already_loaded_async is deferred until after first UI frame
+    // (Java DeferredSoHooksInstaller → finishBusinessSoDecrypt) so we do not
+    // race ART while mapping dexes / drawing splash.
     std::string code_data = read_file(code_path);
     if (code_data.empty()) {
         PLOGE("failed to read code.bin");
@@ -1043,8 +1044,8 @@ PROTECTOR_ENCRYPT void init_app(JNIEnv* env, jclass, jstring protector_dir_j,
     PLOGI("init_app ok, dexes=%s", state.dexes_zip_path.c_str());
 
     junk_code_protect(env);
-    // Second scan after hooks installed — catches late injectors.
-    protector::risk::scan_hooks_and_frida_now();
+    // Light scan after hooks — catch late injectors without repeating the full fast gate.
+    protector::risk::scan_hooks_and_frida_light();
 }
 
 void verify_signature(JNIEnv* env, jclass, jobject context) {
@@ -1054,7 +1055,7 @@ void verify_signature(JNIEnv* env, jclass, jobject context) {
         protector::risk::crash_exit();
         return;
     }
-    protector::risk::scan_hooks_and_frida_now();
+    protector::risk::scan_hooks_and_frida_light();
     verify_app_signature(env, context, expected);
 }
 
@@ -1063,7 +1064,7 @@ jstring read_application_name(JNIEnv* env, jclass) {
 }
 
 jstring native_version(JNIEnv* env, jclass) {
-    return env->NewStringUTF("protector-native/0.7.7");
+    return env->NewStringUTF("protector-native/0.8.4");
 }
 
 jboolean environment_degraded(JNIEnv*, jclass) {

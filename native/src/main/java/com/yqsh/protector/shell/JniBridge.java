@@ -71,8 +71,9 @@ public final class JniBridge {
     public static native void ensureBusinessSo(String soBasename);
 
     /**
-     * After {@link DexMerger#merge}, schedule decrypt of already-mapped business
-     * SOs on a background thread (must not race ART while mapping DEX).
+     * Schedule decrypt of already-mapped business SOs on a background thread.
+     * Call after {@link DexMerger#merge} and preferably after the first UI
+     * frame (see {@code ProxyApplication.DeferredSoHooksInstaller}).
      */
     public static native void finishBusinessSoDecrypt();
 

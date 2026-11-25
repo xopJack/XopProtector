@@ -86,6 +86,17 @@
                   </StackPanel>
                 </StackPanel>
               </Button>
+              <Button x:Name="NavHotfix" Style="{StaticResource NavButton}" Click="Hotfix_Click"
+                      ToolTip="https://hotfix.yqsh168.cn/?from=protector">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="🔥" FontSize="13" Margin="0,0,10,0" VerticalAlignment="Center"/>
+                  <StackPanel>
+                    <TextBlock Text="{x:Static res:Strings.Nav_Hotfix}" FontSize="12"/>
+                    <TextBlock Text="{x:Static res:Strings.Nav_HotfixSub}" FontSize="10" FontFamily="Consolas"
+                               Foreground="{DynamicResource Accent}"/>
+                  </StackPanel>
+                </StackPanel>
+              </Button>
               <Button x:Name="NavHistory" Style="{StaticResource NavButton}" Click="Nav_Click" Tag="history">
                 <StackPanel Orientation="Horizontal">
                   <TextBlock Text="⏱" FontSize="13" Margin="0,0,10,0" VerticalAlignment="Center"/>

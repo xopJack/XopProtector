@@ -96,12 +96,21 @@ static std::vector<SoKey> g_keys;
 static std::vector<std::string> g_pending;
 static std::atomic_bool g_hooks_installed{false};
 /** True if at least one of dlopen / android_dlopen_ext / __loader_* hooked. */
-/** >0 while this thread is inside a linker mmap / call_constructors / dlopen hook. */
+/** >0 while this thread is inside a linker mmap / dlopen hook. */
 static thread_local int g_in_linker_hook = 0;
 
 static std::atomic_bool g_dlopen_hooks_ok{false};
-/** Linker mmap and/or soinfo::call_constructors hooked — extract-inode decrypt is safe. */
+/**
+ * Linker mmap (or mmap64) is hooked, so L2e may map the packaged inode.
+ * .text is decrypted before that mmap returns. call_constructors is never
+ * hooked: on some OEM linkers (Meizu, vivo X200) Dobby there zeroes
+ * .init_array and plaintext constructors jump to pc=0.
+ */
 static std::atomic_bool g_extract_inode_hooks_ok{false};
+/** Linker mmap hooked. Used for L2e when so_plain cannot be executed. */
+static std::atomic_bool g_linker_mmap_hooked{false};
+/** install_linker_extract_hooks already ran (do not Dobby twice). */
+static std::atomic_bool g_extract_hooks_attempted{false};
 /** Linker/libc open/openat rewrite so DT_NEEDED cannot map extract ciphertext. */
 static std::atomic_bool g_linker_open_hooks_ok{false};
 /** Process-local: full keyed materialize already completed successfully. */
@@ -125,7 +134,6 @@ static bool needs_extract_inode(const std::string& base);
 static bool defer_eager_disk(const std::string& base);
 static void hide_extract_inode_helpers();
 static void install_linker_extract_hooks();
-static void decrypt_extract_inode_mapped();
 static void pin_plain_needed_for_extract(const std::string& elf_so,
                                         const void* extinfo = nullptr);
 static std::string keyed_warm_path(const std::string& out_dir, const std::string& name);
@@ -514,6 +522,110 @@ static void unlink_so_plain_if(const std::string& path) {
 
 static off_t file_size_path(const std::string& path);
 static bool file_exists_path(const std::string& path);
+static bool is_plaintext_helper_path(const char* path);
+
+/**
+ * Paths the shell owns: packaged extract under nativeLibraryDir, so_plain /
+ * lib_mirror / memfd helpers, so_cipher materialize trees, and protector
+ * cache extracts. Foreign plugin dirs (e.g. pangle_p) are not controlled.
+ */
+static bool path_is_shell_controlled(const char* path) {
+    if (path == nullptr || path[0] == '\0') return false;
+    if (is_plaintext_helper_path(path)) return true;
+    if (strstr(path, "/so_cipher/") != nullptr) return true;
+    if (strstr(path, "/protector/") != nullptr) return true;
+    std::string nld;
+    {
+        std::lock_guard<std::mutex> lock(g_mu);
+        nld = g_native_lib_dir;
+    }
+    if (!nld.empty()) {
+        const size_t n = nld.size();
+        if (strncmp(path, nld.c_str(), n) == 0
+                && (path[n] == '\0' || path[n] == '/')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Layout-only identity vs packer so_text_diag (file_size + .text offset/size/
+ * sh_addr). Does not check plaintext SHA-256 — ciphertext shares the same
+ * ELF layout as the packaged plaintext expect.
+ */
+static bool mapping_meta_matches_diag(const std::string& base,
+                                      const std::string& path) {
+    if (base.empty() || path.empty()) return false;
+    TextDiagExpect exp{};
+    if (!pick_textdiag_expect(base, nullptr, &exp)) return false;
+    if (exp.text_offset == 0 || exp.text_size == 0) return false;
+    if (exp.file_size > 0) {
+        const off_t sz = file_size_path(path);
+        if (sz <= 0 || static_cast<uint64_t>(sz) != exp.file_size) {
+            return false;
+        }
+    }
+    Elf_Shdr shdr{};
+    get_elf_section(&shdr, path.c_str(), ".text");
+    if (shdr.sh_size == 0 || shdr.sh_offset == 0) return false;
+    if (static_cast<uint64_t>(shdr.sh_offset) != exp.text_offset) return false;
+    if (static_cast<uint64_t>(shdr.sh_size) != exp.text_size) return false;
+    if (exp.text_sh_addr != 0
+            && static_cast<uint64_t>(shdr.sh_addr) != exp.text_sh_addr) {
+        return false;
+    }
+    return true;
+}
+
+/**
+ * RC4 identity gate: a basename key is necessary but not sufficient.
+ * Allow when the mapping path is shell-controlled, or on-disk ELF meta matches
+ * so_text_diag. Fail closed — caller must skip RC4 and must not mark decrypted.
+ * @param reason_out optional short tag for logs (trusted_path / diag_meta / …).
+ */
+static bool mapping_is_decrypt_candidate(const std::string& base,
+                                         const std::string& path,
+                                         const char** reason_out) {
+    auto set_reason = [&](const char* r) {
+        if (reason_out != nullptr) *reason_out = r;
+    };
+    if (base.empty() || path.empty()) {
+        set_reason("empty");
+        return false;
+    }
+    if (path_is_shell_controlled(path.c_str())) {
+        set_reason("trusted_path");
+        return true;
+    }
+    if (mapping_meta_matches_diag(base, path)) {
+        set_reason("diag_meta");
+        return true;
+    }
+    set_reason("foreign_or_meta_mismatch");
+    return false;
+}
+
+/** One WARN per basename+path — linker mmap can hit the gate many times. */
+static std::mutex g_gate_skip_mu;
+static std::unordered_set<std::string> g_gate_skip_logged;
+
+static void log_identity_gate_skip(const char* where,
+                                   const std::string& base,
+                                   const std::string& path,
+                                   const char* reason) {
+    const char* why = reason != nullptr ? reason : "?";
+    const std::string key = base + '\n' + path;
+    {
+        std::lock_guard<std::mutex> lock(g_gate_skip_mu);
+        if (!g_gate_skip_logged.insert(key).second) return;
+    }
+    PLOGW("business so: %s skip RC4 identity_gate=%s name=%s path=%s",
+          where, why, base.c_str(), path.c_str());
+    xop_so_log(ANDROID_LOG_WARN,
+               "[XOP-SO] name=%s %s skip RC4 identity_gate=%s path=%s",
+               base.c_str(), where, why, path.c_str());
+}
 
 /**
  * Verify on-disk ELF .text against packer so_text_diag.
@@ -1300,45 +1412,6 @@ static bool write_via_process_vm(void* dst, const void* src, size_t size) {
 #endif
 }
 
-static bool vm_read_local(void* dst, uintptr_t src, size_t n) {
-    if (dst == nullptr || n == 0) return false;
-    src = strip_va_tag(src);
-#if defined(__NR_process_vm_readv)
-    struct iovec local {};
-    local.iov_base = dst;
-    local.iov_len = n;
-    struct iovec remote {};
-    remote.iov_base = reinterpret_cast<void*>(src);
-    remote.iov_len = n;
-    const ssize_t got = syscall(__NR_process_vm_readv, static_cast<long>(getpid()),
-                                &local, 1L, &remote, 1L, 0L);
-    if (got == static_cast<ssize_t>(n)) return true;
-#endif
-    FILE* fp = fopen_maps_raw();
-    if (fp == nullptr) return false;
-    bool readable = false;
-    std::string line;
-    while (protector::read_maps_record(fp, &line)) {
-        uintptr_t s = 0;
-        uintptr_t e = 0;
-        uint64_t off = 0;
-        bool ex = false;
-        if (!parse_map_span(line.c_str(), &s, &e, &off, &ex)) continue;
-        char perms[8] = {};
-        if (sscanf(line.c_str(), "%*s %7s", perms) != 1) continue;
-        if (strchr(perms, 'r') == nullptr) continue;
-        if (n > e - s) continue;
-        if (src >= s && src <= e - n) {
-            readable = true;
-            break;
-        }
-    }
-    fclose(fp);
-    if (!readable) return false;
-    memcpy(dst, reinterpret_cast<const void*>(src), n);
-    return true;
-}
-
 static bool write_via_proc_mem(void* dst, const void* src, size_t size) {
     const int fd = static_cast<int>(syscall(__NR_openat, AT_FDCWD, "/proc/self/mem",
                                             O_RDWR | O_CLOEXEC));
@@ -1381,7 +1454,9 @@ static TextWriteHow write_mapped_text(uint8_t* text, size_t size, const uint8_t*
     return TextWriteHow::None;
 }
 
-PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
+PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name,
+                                                     const char* forced_path = nullptr,
+                                                     const MappedText* known = nullptr) {
     if (so_name.empty()) return true;
 
     uint8_t key_bytes[16];
@@ -1401,18 +1476,26 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
         return false;
     }
 
-    // Prefer packaged extract mapping when present: so_plain may also appear in
-    // maps while a second soinfo still points at extract ciphertext (L2e).
-    // Do not return early on keyed_mapped_plain — that flag means *a* mapping
-    // was plaintext, not that every inode is.
+    // Prefer shell-controlled packaged extract when present: so_plain may also
+    // appear in maps while a second soinfo still points at extract ciphertext
+    // (L2e). Same-basename foreign plugin mappings (e.g. pangle_p) must not win
+    // over our extract — identity gate below still rejects if only foreign is
+    // mapped. Do not return early on keyed_mapped_plain — that flag means *a*
+    // mapping was plaintext, not that every inode is.
     std::string path;
     bool mapped_plain = false;
-    {
+    if (forced_path != nullptr && forced_path[0] != '\0') {
+        path = forced_path;
+        mapped_plain = strstr(forced_path, "/so_plain/") != nullptr
+                || strstr(forced_path, "/lib_mirror/") != nullptr
+                || strstr(forced_path, "memfd:") != nullptr;
+    } else {
         FILE* fp = fopen_maps_raw();
         if (fp != nullptr) {
             std::string line;
             std::string plain_hit;
             std::string pkg_hit;
+            std::string foreign_hit;
             while (protector::read_maps_record(fp, &line)) {
                 if (line.find("r-xp") == std::string::npos
                         && line.find("rwxp") == std::string::npos) {
@@ -1431,8 +1514,10 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
                 if (memfd || map_path.find("/so_plain/") != std::string::npos
                         || map_path.find("/lib_mirror/") != std::string::npos) {
                     if (plain_hit.empty()) plain_hit = map_path;
-                } else if (pkg_hit.empty()) {
-                    pkg_hit = map_path;
+                } else if (path_is_shell_controlled(map_path.c_str())) {
+                    if (pkg_hit.empty()) pkg_hit = map_path;
+                } else if (foreign_hit.empty()) {
+                    foreign_hit = map_path;
                 }
             }
             fclose(fp);
@@ -1442,6 +1527,9 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
             } else if (!plain_hit.empty()) {
                 path = std::move(plain_hit);
                 mapped_plain = true;
+            } else if (!foreign_hit.empty()) {
+                path = std::move(foreign_hit);
+                mapped_plain = false;
             }
         }
     }
@@ -1457,6 +1545,18 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
         }
         PLOGW("business so path missing: %s", so_name.c_str());
         return false;
+    }
+
+    // Basename key ≠ mapping identity. Foreign same-name SOs must not be RC4'd.
+    {
+        const char* gate_why = nullptr;
+        if (!mapping_is_decrypt_candidate(so_name, path, &gate_why)) {
+            memset(key_bytes, 0, sizeof(key_bytes));
+            if (claim == ClaimResult::Claimed) commit_key(so_name, false);
+            log_identity_gate_skip("in-memory", so_name, path, gate_why);
+            // AlreadyDone: our SO was decrypted earlier; leave key state alone.
+            return claim == ClaimResult::AlreadyDone;
+        }
     }
 
     if (!mapped_plain) {
@@ -1510,7 +1610,9 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
 
     bool ok = false;
     MappedText loc{};
-    if (!locate_mapped_text(path, &loc)) {
+    if (known != nullptr && known->addr != 0 && known->size != 0) {
+        loc = *known;
+    } else if (!locate_mapped_text(path, &loc)) {
         memset(key_bytes, 0, sizeof(key_bytes));
         if (claim == ClaimResult::Claimed) commit_key(so_name, false);
         xop_so_log(ANDROID_LOG_WARN,
@@ -1553,7 +1655,7 @@ PROTECTOR_ENCRYPT static bool decrypt_loaded_text(const std::string& so_name) {
     clear_text_write_failed(so_name);
     ok = true;
     // Extract-inode loads decrypt ciphertext that is still on disk. Mark so a
-    // second RC4 (mmap + call_constructors) cannot re-encrypt the image.
+    // second RC4 from another mmap cannot re-encrypt the image.
     // Only after the bytes were actually decrypted — a deferred attempt must not
     // stick this basename.
     if (!mapped_plain) {
@@ -1659,6 +1761,15 @@ static void strip_verneed_if_old_android(const std::string& path) {
 PROTECTOR_ENCRYPT static bool rc4_text_on_disk_claimed(const std::string& path,
                                                        const std::string& base,
                                                        uint8_t key_bytes[16]) {
+    {
+        const char* gate_why = nullptr;
+        if (!mapping_is_decrypt_candidate(base, path, &gate_why)) {
+            log_identity_gate_skip("disk", base, path, gate_why);
+            memset(key_bytes, 0, 16);
+            commit_key(base, false);
+            return false;
+        }
+    }
     // Illegal: PLAINTEXT + decrypt → double RC4 (RC4 is involution → re-encrypt).
     if (diag_is_plaintext(base)) {
         xop_so_log(ANDROID_LOG_ERROR,
@@ -1752,6 +1863,14 @@ PROTECTOR_ENCRYPT static bool rc4_text_on_disk_claimed(const std::string& path,
 PROTECTOR_ENCRYPT static bool decrypt_text_on_disk(const std::string& path,
                                                    const std::string& base) {
     if (path.empty() || path[0] != '/' || base.empty()) return false;
+
+    {
+        const char* gate_why = nullptr;
+        if (!mapping_is_decrypt_candidate(base, path, &gate_why)) {
+            log_identity_gate_skip("disk", base, path, gate_why);
+            return false;
+        }
+    }
 
     uint8_t key_bytes[16];
     ClaimResult claim = claim_key(base, key_bytes);
@@ -1958,6 +2077,7 @@ static void refresh_lib_mirror(const std::string& cache_root,
                                const std::string& so_plain);
 static void refresh_lib_mirror_from_runtime();
 static bool plant_hardlink_or_copy(const std::string& src, const std::string& dst);
+static bool writable_app_exec_blocked();
 static bool symlink_plain_dep(const std::string& src, const std::string& dst);
 static int plant_extract_sidecars(const std::string& dest, const std::string& nld);
 static void publish_keyed_extract_mirrors(const std::string& cache_root,
@@ -2251,7 +2371,6 @@ static std::string fd_path_raw(int fd) {
     return std::string(buf, static_cast<size_t>(n));
 }
 
-static thread_local int g_extract_decrypt_depth = 0;
 
 static bool is_plaintext_helper_path(const char* path) {
     if (path == nullptr) return false;
@@ -2295,64 +2414,11 @@ static bool extract_text_decrypt_ready(const std::string& base) {
     return locate_mapped_text(path, &loc);
 }
 
-static void decrypt_extract_inode_mapped() {
-    if (g_extract_decrypt_depth > 0) return;
-    if (!has_sokeys()) return;
-    std::unordered_set<std::string> pending;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        for (const auto& k : g_keys) {
-            if (g_extract_inode_decrypted.count(k.name) == 0) {
-                pending.insert(k.name);
-            }
-        }
-    }
-    if (pending.empty()) return;
-
-    FILE* fp = fopen_maps_raw();
-    if (fp == nullptr) return;
-    std::vector<std::string> to_decrypt;
-    std::unordered_set<std::string> saw_plain;
-    std::string line;
-    while (protector::read_maps_record(fp, &line)) {
-        std::string path;
-        if (!protector::maps_pathname(line, &path)) continue;
-        if (path.find(".so") == std::string::npos) continue;
-        if (is_plaintext_helper_path(path.c_str())) continue;
-        std::string base = basename_of(path.c_str());
-        auto it = pending.find(base);
-        if (it == pending.end()) continue;
-        if (mapping_is_known_plaintext(base, path)) {
-            saw_plain.insert(base);
-            continue;
-        }
-        to_decrypt.push_back(base);
-        pending.erase(it);
-        saw_plain.erase(base);
-        if (pending.empty()) break;
-    }
-    fclose(fp);
-
-    for (const auto& name : saw_plain) {
-        if (pending.count(name) == 0) continue;
-        std::lock_guard<std::mutex> lock(g_mu);
-        g_extract_inode_decrypted.insert(name);
-    }
-
-    ++g_extract_decrypt_depth;
-    for (const auto& name : to_decrypt) {
-        (void)decrypt_loaded_text(name);
-    }
-    --g_extract_decrypt_depth;
-}
-
 using LinkerMmapFn = void* (*)(void*, size_t, int, int, int, off_t);
 static LinkerMmapFn g_orig_linker_mmap = nullptr;
 #if defined(__LP64__)
 static LinkerMmapFn g_orig_linker_mmap64 = nullptr;
 #endif
-using LinkerCallCtorsFn = void (*)(void*);
-static LinkerCallCtorsFn g_orig_call_constructors = nullptr;
 using LoaderDlopenExt4Fn = void* (*)(const char*, int, const android_dlextinfo*, const void*);
 static LoaderDlopenExt4Fn g_orig_loader_dlopen_ext = nullptr;
 static std::string path_for_dlopen(const char* filename);
@@ -2369,19 +2435,139 @@ struct LinkerHookScope {
     ~LinkerHookScope() { --g_in_linker_hook; }
 };
 
-static void on_linker_file_mmap(const std::string& fpath) {
-    if (g_in_execmod_probe > 0) return;
-    if (fpath.empty() || is_plaintext_helper_path(fpath.c_str())) return;
+struct LinkerFileSpan {
+    uintptr_t addr = 0;
+    size_t length = 0;
+    uint64_t offset = 0;
+    bool exec = false;
+};
+
+static std::mutex g_linker_span_mu;
+/** Keyed basename → PT_LOAD slices seen in this process. Cleared after decrypt. */
+static std::unordered_map<std::string, std::vector<LinkerFileSpan>> g_linker_spans;
+
+/**
+ * .text VA from spans we just mapped. Does not read /proc/self/maps: that file
+ * can lag the mmap return. Decrypt finishes before mmap returns.
+ */
+static bool text_addr_from_spans(const std::string& path,
+                                const std::vector<LinkerFileSpan>& spans,
+                                MappedText* out) {
+    if (out == nullptr || path.empty() || spans.empty()) return false;
+    uint64_t p_vaddr = 0;
+    uint64_t p_off = 0;
+    if (!read_min_pt_load(path.c_str(), &p_vaddr, &p_off)) return false;
+    const int ps = getpagesize();
+    if (ps <= 0) return false;
+    const uint64_t want = p_off & ~static_cast<uint64_t>(ps - 1);
+    uintptr_t map_start = 0;
+    bool found = false;
+    for (const auto& sp : spans) {
+        if (sp.offset != want || sp.addr == 0 || sp.length == 0) continue;
+        map_start = sp.addr;
+        found = true;
+        break;
+    }
+    if (!found) return false;
+    if (p_vaddr != 0 && map_start < static_cast<uintptr_t>(p_vaddr)) return false;
+
+    Elf_Shdr shdr{};
+    get_elf_section(&shdr, path.c_str(), ".text");
+    if (shdr.sh_size == 0 || shdr.sh_size > static_cast<uint64_t>(SIZE_MAX)) return false;
+    const auto text = static_cast<uintptr_t>(map_start - static_cast<uintptr_t>(p_vaddr)
+                                             + static_cast<uintptr_t>(shdr.sh_addr));
+    const auto text_size = static_cast<size_t>(shdr.sh_size);
+    if (text_size == 0) return false;
+    const auto page = static_cast<uintptr_t>(ps);
+    if (text > static_cast<uintptr_t>(-1) - (text_size - 1)) return false;
+    const uintptr_t first = text & ~(page - 1);
+    const uintptr_t last = (text + text_size - 1) & ~(page - 1);
+    for (uintptr_t p = first;;) {
+        bool hit = false;
+        for (const auto& sp : spans) {
+            if (!sp.exec || sp.length == 0) continue;
+            const uintptr_t end = sp.addr + sp.length;
+            if (end < sp.addr) continue;
+            if (sp.addr <= p && p < end) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) return false;
+        if (p == last) break;
+        if (p > static_cast<uintptr_t>(-1) - page) return false;
+        p += page;
+    }
+    out->addr = text;
+    out->size = text_size;
+    return true;
+}
+
+/** @return false when this mapping covers .text and decrypt failed. Caller unmaps. */
+static bool on_linker_file_mmap(const std::string& fpath, void* map, size_t length,
+                               off_t offset, int prot) {
+    if (g_in_execmod_probe > 0) return true;
+    if (fpath.empty() || is_plaintext_helper_path(fpath.c_str())) return true;
+    if (map == nullptr || map == MAP_FAILED || length == 0 || offset < 0) return true;
     const std::string base = maps_basename(fpath);
     {
         std::lock_guard<std::mutex> lock(g_mu);
-        if (g_extract_inode_decrypted.count(base) != 0) return;
-        if (find_key_unlocked(base) == nullptr) return;
+        if (g_extract_inode_decrypted.count(base) != 0) return true;
+        if (find_key_unlocked(base) == nullptr) return true;
     }
-    // Partial segment: lowest PT_LOAD may not be mapped yet. Do not RC4 and do
-    // not mark the basename safe. call_constructors retries once the image is whole.
-    if (!extract_text_decrypt_ready(base)) return;
-    maybe_decrypt_by_name(base);
+    // Basename key hit is not identity — refuse foreign same-name mmap early.
+    {
+        const char* gate_why = nullptr;
+        if (!mapping_is_decrypt_candidate(base, fpath, &gate_why)) {
+            log_identity_gate_skip("mmap", base, fpath, gate_why);
+            return true;
+        }
+    }
+    std::vector<LinkerFileSpan> spans;
+    {
+        std::lock_guard<std::mutex> lock(g_linker_span_mu);
+        auto& slot = g_linker_spans[base];
+        bool replaced = false;
+        for (auto& sp : slot) {
+            if (sp.offset == static_cast<uint64_t>(offset)) {
+                sp.addr = reinterpret_cast<uintptr_t>(map);
+                sp.length = length;
+                sp.exec = (prot & PROT_EXEC) != 0;
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) {
+            if (slot.size() >= 16) slot.erase(slot.begin());
+            slot.push_back(LinkerFileSpan{
+                    reinterpret_cast<uintptr_t>(map), length,
+                    static_cast<uint64_t>(offset), (prot & PROT_EXEC) != 0});
+        }
+        spans = slot;
+    }
+    // Decrypt before mmap returns so the linker relocates plaintext. A partial
+    // PT_LOAD stays recorded until .text is fully covered. There is no
+    // call_constructors hook: a covered range that stays ciphertext fails
+    // this mmap instead of running constructors.
+    MappedText known{};
+    const bool from_spans = text_addr_from_spans(fpath, spans, &known);
+    if (!from_spans && !extract_text_decrypt_ready(base)) return true;
+    const bool ok = decrypt_loaded_text(base, fpath.c_str(), from_spans ? &known : nullptr);
+    if (ok) {
+        std::lock_guard<std::mutex> lock(g_linker_span_mu);
+        g_linker_spans.erase(base);
+        return true;
+    }
+    if (!from_spans) return true;
+    {
+        std::lock_guard<std::mutex> lock(g_linker_span_mu);
+        g_linker_spans.erase(base);
+    }
+    xop_so_log(ANDROID_LOG_ERROR,
+               "[XOP-SO] FATAL name=%s mmap decrypt failed — refuse mapping path=%s",
+               base.c_str(), fpath.c_str());
+    PLOGE("business so: refuse mmap, .text still ciphertext %s", base.c_str());
+    return false;
 }
 
 static void* hooked_linker_mmap(void* addr, size_t length, int prot, int flags,
@@ -2392,7 +2578,10 @@ static void* hooked_linker_mmap(void* addr, size_t length, int prot, int flags,
             : mmap(addr, length, prot, flags, fd, offset);
     if (p == MAP_FAILED || fd < 0 || (flags & MAP_ANONYMOUS) != 0) return p;
     if ((prot & PROT_READ) == 0) return p;
-    on_linker_file_mmap(fd_path_raw(fd));
+    if (!on_linker_file_mmap(fd_path_raw(fd), p, length, offset, prot)) {
+        munmap(p, length);
+        return MAP_FAILED;
+    }
     return p;
 }
 
@@ -2405,141 +2594,93 @@ static void* hooked_linker_mmap64(void* addr, size_t length, int prot, int flags
             : mmap(addr, length, prot, flags, fd, offset);
     if (p == MAP_FAILED || fd < 0 || (flags & MAP_ANONYMOUS) != 0) return p;
     if ((prot & PROT_READ) == 0) return p;
-    on_linker_file_mmap(fd_path_raw(fd));
+    if (!on_linker_file_mmap(fd_path_raw(fd), p, length, offset, prot)) {
+        munmap(p, length);
+        return MAP_FAILED;
+    }
     return p;
 }
 #endif
 
-/**
- * soinfo layout is not stable across API 23–35. Match only an absolute path
- * (starts with '/', ends with '/' + basename) in readable words, so a bare
- * DT_NEEDED soname cannot skip an unrelated constructor (for example libc).
- */
-static bool soinfo_blocks_constructors(void* soinfo, std::string* hit) {
-    if (soinfo == nullptr || hit == nullptr) return false;
-    std::vector<std::string> failed;
-    {
-        std::lock_guard<std::mutex> lock(g_mu);
-        failed.reserve(g_text_write_failed.size());
-        for (const auto& name : g_text_write_failed) {
-            if (g_extract_inode_decrypted.count(name) == 0) failed.push_back(name);
+/** First defined symbol among names. Bionic linker64 exports __dl_mmap, not mmap. */
+static void* resolve_linker_symbol_any(const char* elf_path, uintptr_t load_bias,
+                                       const char* const* names, size_t count,
+                                       const char** hit) {
+    for (size_t i = 0; i < count; ++i) {
+        void* addr = resolve_linker_symbol(elf_path, load_bias, names[i], nullptr);
+        if (addr != nullptr) {
+            if (hit != nullptr) *hit = names[i];
+            return addr;
         }
     }
-    if (failed.empty()) return false;
-    uintptr_t words[32];
-    const auto base = reinterpret_cast<uintptr_t>(soinfo);
-    if (!vm_read_local(words, base, sizeof(words))) return false;
-    for (uintptr_t word : words) {
-        if (word < 4096) continue;
-        char buf[512];
-        size_t n = 0;
-        bool ended = false;
-        while (n + 1 < sizeof(buf)) {
-            if (n > 0 && word > static_cast<uintptr_t>(-1) - n) break;
-            char c = 0;
-            if (!vm_read_local(&c, word + n, 1)) break;
-            buf[n++] = c;
-            if (c == '\0') {
-                ended = true;
-                break;
-            }
-        }
-        if (!ended || n < 2 || buf[0] != '/') continue;
-        if (is_plaintext_helper_path(buf)) continue;
-        const size_t len = n - 1;
-        for (const auto& name : failed) {
-            const std::string suffix = "/" + name;
-            if (len < suffix.size()) continue;
-            if (memcmp(buf + (len - suffix.size()), suffix.data(), suffix.size()) != 0) {
-                continue;
-            }
-            *hit = name;
-            return true;
-        }
-    }
-    return false;
-}
-
-static void hooked_call_constructors(void* soinfo) {
-    LinkerHookScope in_linker;
-    // Must run before constructors even if mmap hook missed (ART/linker
-    // mmap variants). Splash initOSG maps libopencv_world from extract.
-    decrypt_extract_inode_mapped();
-    std::string blocked;
-    if (soinfo_blocks_constructors(soinfo, &blocked)) {
-        xop_so_log(ANDROID_LOG_ERROR,
-                   "[XOP-SO] FATAL name=%s skip call_constructors — .text still ciphertext",
-                   blocked.c_str());
-        PLOGE("business so: skip constructors, in-memory .text write failed %s",
-              blocked.c_str());
-        return;
-    }
-    if (g_orig_call_constructors != nullptr) {
-        g_orig_call_constructors(soinfo);
-    }
+    return nullptr;
 }
 
 static void install_linker_extract_hooks() {
-    if (g_extract_inode_hooks_ok.load(std::memory_order_acquire)) return;
     LinkerInfo li{};
     if (!find_linker_info(&li) || li.path[0] == 0) {
-        PLOGW("business so: linker not found — extract-inode decrypt disabled");
+        PLOGE("business so: FATAL linker not found — extract-inode decrypt disabled");
         return;
     }
-    bool any = false;
-    void* mmap_addr = resolve_linker_symbol(li.path, li.load_bias, "mmap", nullptr);
+    if (g_extract_hooks_attempted.exchange(true, std::memory_order_acq_rel)) return;
+    bool mmap_ok = false;
+    // Android linker (API 21+) prefixes its own libc wrappers with __dl_.
+    // vivo linker64 BuildId 64d219a9 has __dl_mmap/__dl_mmap64 only; both are
+    // the same svc stub. Exact "mmap" misses that class of linker.
+    const char* mmap_names[] = {"mmap", "__dl_mmap"};
+    const char* mmap_hit = nullptr;
+    void* mmap_addr = resolve_linker_symbol_any(
+            li.path, li.load_bias, mmap_names, ARRAY_LEN(mmap_names), &mmap_hit);
     if (mmap_addr != nullptr) {
         int rc = DobbyHook(mmap_addr, reinterpret_cast<dobby_dummy_func_t>(hooked_linker_mmap),
                            reinterpret_cast<dobby_dummy_func_t*>(&g_orig_linker_mmap));
         if (rc == 0) {
-            any = true;
-            PLOGI("business so: linker mmap hooked path=%s", li.path);
+            mmap_ok = true;
+            PLOGI("business so: linker %s hooked path=%s", mmap_hit, li.path);
         } else {
-            PLOGW("business so: linker mmap DobbyHook rc=%d", rc);
+            PLOGE("business so: FATAL linker %s DobbyHook rc=%d path=%s",
+                  mmap_hit, rc, li.path);
         }
+    } else {
+        PLOGE("business so: FATAL linker mmap symbol not found (tried mmap, __dl_mmap) path=%s",
+              li.path);
     }
 #if defined(__LP64__)
     // armeabi-v7a mmap64 takes off64_t. Hooking it with off_t mis-aligns the
     // offset and maps the wrong file pages. 32-bit keeps mmap only.
-    void* mmap64_addr = resolve_linker_symbol(li.path, li.load_bias, "mmap64", nullptr);
+    const char* mmap64_names[] = {"mmap64", "__dl_mmap64"};
+    const char* mmap64_hit = nullptr;
+    void* mmap64_addr = resolve_linker_symbol_any(
+            li.path, li.load_bias, mmap64_names, ARRAY_LEN(mmap64_names), &mmap64_hit);
     if (mmap64_addr != nullptr && mmap64_addr != mmap_addr) {
         int rc = DobbyHook(mmap64_addr,
                            reinterpret_cast<dobby_dummy_func_t>(hooked_linker_mmap64),
                            reinterpret_cast<dobby_dummy_func_t*>(&g_orig_linker_mmap64));
         if (rc == 0) {
-            any = true;
-            PLOGI("business so: linker mmap64 hooked");
+            mmap_ok = true;
+            PLOGI("business so: linker %s hooked", mmap64_hit);
+        } else {
+            PLOGE("business so: FATAL linker %s DobbyHook rc=%d", mmap64_hit, rc);
         }
     }
 #endif
-    void* ctors = resolve_linker_symbol(li.path, li.load_bias, nullptr, "call_constructors");
-    if (ctors == nullptr) {
-        ctors = resolve_linker_symbol(li.path, li.load_bias, nullptr, "CallConstructors");
-    }
-    if (ctors != nullptr) {
-        int rc = DobbyHook(ctors, reinterpret_cast<dobby_dummy_func_t>(hooked_call_constructors),
-                           reinterpret_cast<dobby_dummy_func_t*>(&g_orig_call_constructors));
-        if (rc == 0) {
-            any = true;
-            PLOGI("business so: linker call_constructors hooked path=%s", li.path);
-        } else {
-            PLOGW("business so: linker call_constructors DobbyHook rc=%d", rc);
-        }
-    } else {
-        PLOGW("business so: linker call_constructors symbol missing path=%s", li.path);
-    }
-    // Do NOT DobbyHook __loader_android_dlopen_ext. On some OEM Android 11
-    // linkers the trampoline never returns (SPRING2_PRO: Helper.install hang).
-    // bytehook covers ClassLoader / libdl PLT; L2e decrypt uses mmap +
-    // call_constructors hooks below. DT_NEEDED of keyed extract SOs still hits
-    // those inode hooks when the linker maps the file.
-    if (any) {
+    if (mmap_ok) {
+        g_linker_mmap_hooked.store(true, std::memory_order_release);
+        // Same gate the load path already uses for L2e. It means mmap decrypt
+        // is armed, not that call_constructors is hooked.
         g_extract_inode_hooks_ok.store(true, std::memory_order_release);
         hide_extract_inode_helpers();
-        PLOGI("business so: extract-inode in-memory decrypt enabled");
+        PLOGI("business so: extract-inode in-memory decrypt enabled (mmap)");
     } else {
-        PLOGW("business so: no linker mmap/ctors hook — keep so_plain path-load");
+        PLOGE("business so: FATAL linker mmap not hooked — so_plain only when that file is executable path=%s",
+              li.path);
     }
+    // Do NOT DobbyHook call_constructors. On Meizu and vivo X200 the trampoline
+    // zeroes .init_array, so plaintext libmmkv jumps to pc=0. Do NOT DobbyHook
+    // __loader_android_dlopen_ext either (SPRING2_PRO: the trampoline never
+    // returns). bytehook covers ClassLoader / libdl PLT. Keyed .text is
+    // decrypted before mmap returns; a covered range that stays ciphertext
+    // fails that mmap.
 }
 
 static bool file_execmod_ok() {
@@ -2728,7 +2869,37 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
     // needs_extract_inode stays a packer flag (eager-skip / helper hide).
     if (!extract.empty() && file_exists_path(extract)) {
         const bool hooks = extract_inode_hooks_ok();
-        if (!hooks || !file_execmod_ok()) {
+        // No linker mmap hook: do not map packaged ciphertext when so_plain
+        // can be executed. targetSdk>=29 on Android 10+ rejects exec from
+        // code_cache; those devices stay on the packaged inode and decrypt
+        // .text inside the mmap hook before the linker relocates.
+        if (!hooks && !writable_app_exec_blocked()) {
+            plan.linker_name = plain_path;
+            plan.content_path = plain_path;
+            plan.so_plain_path = plain_path;
+            plan.use_library_fd = false;
+            plan.in_memory_decrypt = false;
+            if (!cache_root.empty()) {
+                std::string mirror_dir = cache_root + "/" + kLibMirror;
+                std::string mirror_so = mirror_dir + "/" + base;
+                mkdir(mirror_dir.c_str(), 0700);
+                (void)plant_hardlink_or_copy(plain_path, mirror_so);
+            }
+            {
+                std::lock_guard<std::mutex> lock(g_diag_mu);
+                SoDiagRec& r = g_diag[base];
+                r.layer = "L3";
+                r.state = "PLAINTEXT";
+                r.output = plain_path;
+                diag_emit(base, r);
+            }
+            PLOGI("business so: load L3 so_plain (linker mmap not hooked) %s", base.c_str());
+            xop_so_log(ANDROID_LOG_INFO,
+                       "[XOP-SO] name=%s layer=L3 so_plain (linker mmap not hooked) path=%s",
+                       base.c_str(), plain_path.c_str());
+            return plan;
+        }
+        if (!hooks && !g_linker_mmap_hooked.load(std::memory_order_acquire)) {
             plan.linker_name.clear();
             plan.content_path.clear();
             plan.use_library_fd = false;
@@ -2741,15 +2912,33 @@ static KeyedOpenPlan plan_keyed_open(const std::string& base, const std::string&
                 r.output.clear();
                 diag_emit(base, r);
             }
-            diag_log_dlopen(base, {}, hooks ? "blocked_execmod" : "blocked_no_hooks");
-            PLOGE("business so: FATAL %s, refuse memfd %s",
-                  hooks ? "execmod denied" : "extract-inode hooks missing",
+            diag_log_dlopen(base, {}, "blocked_no_hooks");
+            PLOGE("business so: FATAL no linker mmap hook and so_plain not executable %s",
                   base.c_str());
             xop_so_log(ANDROID_LOG_ERROR,
-                       "[XOP-SO] FATAL name=%s %s — refuse memfd "
+                       "[XOP-SO] FATAL name=%s no linker mmap hook and so_plain not executable",
+                       base.c_str());
+            return plan;
+        }
+        if (!file_execmod_ok()) {
+            plan.linker_name.clear();
+            plan.content_path.clear();
+            plan.use_library_fd = false;
+            plan.in_memory_decrypt = false;
+            {
+                std::lock_guard<std::mutex> lock(g_diag_mu);
+                SoDiagRec& r = g_diag[base];
+                r.layer = "L2e";
+                r.state = "ENCRYPTED";
+                r.output.clear();
+                diag_emit(base, r);
+            }
+            diag_log_dlopen(base, {}, "blocked_execmod");
+            PLOGE("business so: FATAL execmod denied, refuse memfd %s", base.c_str());
+            xop_so_log(ANDROID_LOG_ERROR,
+                       "[XOP-SO] FATAL name=%s execmod denied — refuse memfd "
                        "(kernel maps must stay on packaged extract)",
-                       base.c_str(),
-                       hooks ? "execmod denied" : "extract-inode hooks missing");
+                       base.c_str());
             return plan;
         }
         pin_plain_needed_for_extract(extract);
@@ -2871,7 +3060,7 @@ static void* invoke_android_dlopen_ext(const char* name, int flags,
     // Dobby-saved __loader_android_dlopen_ext trampoline from inside a bytehook
     // stub has been observed to never return on some OEM Android 11 devices
     // (SPRING2_PRO: Helper.install → libSdkyclx_clx.so splash hang). L2e still
-    // relies on linker mmap / call_constructors hooks, not this trampoline.
+    // relies on the linker mmap hook, not this trampoline.
     ++g_in_keyed_plan_fallback;
     void* h = nullptr;
     if (info != nullptr) {
@@ -3909,6 +4098,8 @@ static bool plant_hardlink_or_copy(const std::string& src, const std::string& ds
     if (link(src.c_str(), dst.c_str()) == 0) {
         return true;
     }
+    PLOGW("business so: hardlink failed errno=%d %s -> %s; copying",
+          errno, src.c_str(), dst.c_str());
     return copy_file_bytes(src, dst, /*force=*/true);
 }
 
@@ -4644,6 +4835,16 @@ static void preload_one(const std::string& plain_dir,
     std::string path = plain_dir + "/" + base;
     if (!file_exists_path(path)) return; // system / absent dep — let linker resolve
 
+    // No mmap decrypt and so_plain is not executable: dlopen of a plaintext
+    // dep lets the linker map packaged ciphertext via DT_NEEDED (libaosl
+    // SEGV_ACCERR inside call_constructors). Refuse the pin instead.
+    if (!g_linker_mmap_hooked.load(std::memory_order_acquire)
+            && writable_app_exec_blocked()) {
+        fail++;
+        PLOGE("business so: FATAL preload dlopen skipped (no mmap hook) %s",
+              base.c_str());
+        return;
+    }
     visiting.insert(base);
     for (const auto& need : read_dt_needed(path)) {
         preload_one(plain_dir, need, visiting, loaded, ok, fail);
@@ -4845,6 +5046,15 @@ void preload_so_plain() {
     if (cache_root.empty()) return;
 
     if (!hooks) {
+        if (!g_linker_mmap_hooked.load(std::memory_order_acquire)
+                && writable_app_exec_blocked()) {
+            PLOGE("business so: FATAL preload skipped — no linker mmap hook "
+                  "and so_plain not executable");
+            xop_so_log(ANDROID_LOG_ERROR,
+                       "[XOP-SO] FATAL preload skipped — no linker mmap hook "
+                       "and so_plain not executable");
+            return;
+        }
         PLOGW("business so: preload — hooks missing, force full materialize + pin");
         materialize_all_keyed_sos();
         std::string plain_dir = cache_root + "/so_plain";
@@ -4920,7 +5130,7 @@ static void pin_plain_needed_for_extract(const std::string& elf_so,
         }
         if (!keyed) continue;
         // Never disk-RC4 DT_NEEDED on the load path. Existing so_plain is
-        // optional; missing deps map extract and decrypt in RAM (mmap/ctors).
+        // optional; missing deps map extract and decrypt in RAM (mmap).
         if (!file_exists_path(plain_dir + "/" + need)) continue;
         preload_one(plain_dir, need, visiting, loaded, ok, fail);
     }

@@ -8,9 +8,9 @@ import org.junit.jupiter.api.Test;
 class SoDecryptModeCliParseTest {
 
     @Test
-    void defaultIsEager() throws Exception {
+    void defaultIsLazy() throws Exception {
         ProtectOptions o = PackerMain.parseArgs(new String[]{"in.apk"});
-        assertEquals(ProtectOptions.SoDecryptMode.EAGER, o.soDecryptMode);
+        assertEquals(ProtectOptions.SoDecryptMode.LAZY, o.soDecryptMode);
     }
 
     @Test

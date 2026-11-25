@@ -101,6 +101,18 @@ public class PackerMain {
     private boolean encryptAssets = false;
     /** DexFile(sourceDir) scan compat — default on. */
     private boolean dexScanCompat = true;
+    /** Class-split: one-level parent of applicationId (default on). */
+    private boolean businessParentPrefix = true;
+    /** Class-split: non-SDK DEX package clustering (default on). */
+    private boolean businessAutoDiscover = true;
+    private int businessDiscoverMinClasses =
+            BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES;
+    /** Cross-vendor Manifest Application → leaf package (default on). */
+    private boolean manifestAppCrossVendorLeaf = true;
+    /** Exact types for trusted Manifest components (default on). */
+    private boolean manifestBusinessExact = true;
+    /** Exact types for ambiguous cross-package components (default on). */
+    private boolean manifestAmbiguousExact = true;
     /** Phase 2B: shorten res/ paths + rewrite resources.arsc (default off). */
     private boolean enableResProtect = false;
     /** Phase 3: proxy/VPN heuristics (default off). */
@@ -117,8 +129,16 @@ public class PackerMain {
     private String protectSoAbi = "all";
     /** Exact SO basenames to skip (see {@code --protect-so-exclude}). */
     private final java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
-    /** Runtime SO decrypt timing — default eager (full materialize + preload). */
-    private ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
+    /** Runtime SO decrypt timing — default lazy (faster cold-start). */
+    private ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.LAZY;
+    /** Application + LAUNCHER stay plain (default off — encrypt Application). */
+    private boolean startupPlain = false;
+    /** Extra startup-plain prefixes ({@code --startup-plain-prefix}). */
+    private final List<String> startupPlainPrefixes = new ArrayList<>();
+    /**
+     * Application leaf package plain. {@code null}/{@code false} = off (default).
+     */
+    private Boolean startupPlainAppLeaf = null;
     /** Release-visible [XOP-SO] diagnostics via config.json so_diag. */
     private boolean soDiag = false;
     /** Per-APK PVM2 opcode morph (Phase 3); set in protect(). */
@@ -179,8 +199,22 @@ public class PackerMain {
             }
         }
         soDecryptMode = options.soDecryptMode != null
-                ? options.soDecryptMode : ProtectOptions.SoDecryptMode.EAGER;
+                ? options.soDecryptMode : ProtectOptions.SoDecryptMode.LAZY;
+        startupPlain = options.startupPlain;
+        startupPlainPrefixes.clear();
+        if (options.startupPlainPrefixes != null) {
+            startupPlainPrefixes.addAll(options.startupPlainPrefixes);
+        }
+        startupPlainAppLeaf = options.startupPlainAppLeaf;
         soDiag = options.soDiag;
+        businessParentPrefix = options.businessParentPrefix;
+        businessAutoDiscover = options.businessAutoDiscover;
+        businessDiscoverMinClasses = options.businessDiscoverMinClasses > 0
+                ? options.businessDiscoverMinClasses
+                : BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES;
+        manifestAppCrossVendorLeaf = options.manifestAppCrossVendorLeaf;
+        manifestBusinessExact = options.manifestBusinessExact;
+        manifestAmbiguousExact = options.manifestAmbiguousExact;
         applicationOverride = options.applicationOverride;
         certSha256Override = options.certSha256Override;
         riskFlags = options.riskFlags;
@@ -333,6 +367,15 @@ public class PackerMain {
                 + "[--protect-so-exclude <liba.so,libb.so>] "
                 + "[--so-decrypt-mode eager|lazy] "
                 + "[--so-diag] "
+                + "[--startup-plain|--no-startup-plain] "
+                + "[--startup-plain-prefix Lcom/foo/ui/activity/]... "
+                + "[--startup-plain-app-leaf|--no-startup-plain-app-leaf] "
+                + "[--business-parent-prefix|--no-business-parent-prefix] "
+                + "[--business-auto-discover|--no-business-auto-discover] "
+                + "[--business-discover-min-classes <n>] "
+                + "[--manifest-app-cross-vendor-leaf|--no-manifest-app-cross-vendor-leaf] "
+                + "[--manifest-business-exact|--no-manifest-business-exact] "
+                + "[--manifest-ambiguous-exact|--no-manifest-ambiguous-exact] "
                 + "[--application <real.Application>] "
                 + "[--cert-sha256 <hex>] "
                 + "[--risk-flags <int>] [--rasp-action <0|1|2>] [--report-enabled <0|1>] "
@@ -340,13 +383,17 @@ public class PackerMain {
                 + "[--keystore <file> --alias <alias> --storepass <pass> [--keypass <pass>]]");
         System.err.println("  channel …        stamp/read signing-block channel (see: channel help)");
         System.err.println("  --profile          hollow / VMP intensity (default balanced)");
-        System.err.println("                     balanced/perf=encrypt DEX; auto True-VMP on");
+        System.err.println("                     balanced=encrypt app/cluster prefixes; auto True-VMP on");
         System.err.println("                     /wxapi/ + all Alipay types (pay hot-path denylist empty)");
-        System.err.println("                     industry=same + IndustryVmpRules default on;");
+        System.err.println("                     perf=narrow class-split (exact+VMP+hollow-prefix only;");
+        System.err.println("                     no app/cluster prefix; opt-in --startup-plain-app-leaf)");
+        System.err.println("                     industry=same as balanced + IndustryVmpRules default on;");
         System.err.println("                     SO budget defaults 48/24 MB unless overridden");
         System.err.println("                     aggressive=all non-SDK business types hollow");
         System.err.println("                     max=near hollow-all (skip Landroid/Landroidx)");
-        System.err.println("  --hollow-prefix    allowlist type prefix (repeatable; enables hollow)");
+        System.err.println("  --dex-layout       deprecated; ignored (packing always class-splits)");
+        System.err.println("  --hollow-prefix    allowlist type prefix (repeatable; also extracts to zip)");
+        System.err.println("                     + enables hollow on extracted business DEX");
         System.err.println("  --vmp-prefix       PVM1-pack methods (decode→DEX; not interpreter)");
         System.err.println("  --true-vmp-prefix  extra True-VMP prefixes (additive)");
         System.err.println("  --payment-auto-vmp / --no-payment-auto-vmp");
@@ -377,9 +424,40 @@ public class PackerMain {
         System.err.println("  --protect-so-abi   all (default) | arm64-v8a | …");
         System.err.println("  --protect-so-exclude  comma-separated basenames to never encrypt");
         System.err.println("                     (e.g. libd3.so,libzhd3d.so); repeatable");
-        System.err.println("  --so-decrypt-mode  eager (default)=full materialize+preload at cold start;");
-        System.err.println("                     lazy=on-demand + background fill (this process only)");
+        System.err.println("  --so-decrypt-mode  lazy (default)=on-demand + background fill;");
+        System.err.println("                     eager=full materialize+preload at cold start");
         System.err.println("                     Prefer loadLibrary after Application attach.");
+        System.err.println("  --startup-plain / --no-startup-plain");
+        System.err.println("                     keep Application + MAIN/LAUNCHER activities in");
+        System.err.println("                     plain root DEX for install AOT (default OFF;");
+        System.err.println("                     Application encrypted unless --startup-plain)");
+        System.err.println("  --startup-plain-prefix  extra plain type prefix (repeatable; P1)");
+        System.err.println("                     e.g. Lcom/ideack/notes/ui/activity/");
+        System.err.println("  --startup-plain-app-leaf / --no-startup-plain-app-leaf");
+        System.err.println("                     keep Application leaf package plain (default OFF;");
+        System.err.println("                     was auto-ON for --profile perf before default flip)");
+        System.err.println("  DEX packing        always class-splits isBusinessType → dexes.zip;");
+        System.err.println("                     non-business stay in APK root (strip when safe;");
+        System.err.println("                     Compose-mixed DEX may KEEP_FULL_UNPROTECTED);");
+        System.err.println("                     runtime loads extract via DexMerger");
+        System.err.println("  --business-parent-prefix / --no-business-parent-prefix");
+        System.err.println("                     also encrypt one-level parent of applicationId");
+        System.err.println("                     (com.foo.bar.app → Lcom/foo/bar/; default ON;");
+        System.err.println("                     never company-root Lcom/foo/)");
+        System.err.println("  --business-auto-discover / --no-business-auto-discover");
+        System.err.println("                     cluster non-SDK DEX packages into class-split");
+        System.err.println("                     (default ON; Manifest components always scanned)");
+        System.err.println("  --business-discover-min-classes <n>");
+        System.err.println("                     min classes for auto-discover (default "
+                + BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES + ")");
+        System.err.println("  --manifest-app-cross-vendor-leaf / --no-manifest-app-cross-vendor-leaf");
+        System.err.println("                     when Application is outside applicationId vendor,");
+        System.err.println("                     promote its leaf package (default ON; deny/minClasses)");
+        System.err.println("  --manifest-business-exact / --no-manifest-business-exact");
+        System.err.println("                     exact-match trusted Manifest components (default ON)");
+        System.err.println("  --manifest-ambiguous-exact / --no-manifest-ambiguous-exact");
+        System.err.println("                     exact-match ambiguous cross-package components");
+        System.err.println("                     (default ON; never their package prefixes)");
         System.err.println("  --so-diag          embed so_diag=true (Release [XOP-SO] logs; or setprop");
         System.err.println("                     debug.protector.so_diag=1)");
         System.err.println("  --risk-flags      bitmask (default 50 = disable CRC+Root+Emulator)");
@@ -406,6 +484,13 @@ public class PackerMain {
         boolean encryptAssetsFlag = false;
         boolean enableResProtectFlag = false;
         boolean dexScanCompatFlag = true;
+        boolean businessParentPrefixFlag = true;
+        boolean businessAutoDiscoverFlag = true;
+        boolean manifestAppCrossVendorLeafFlag = true;
+        boolean manifestBusinessExactFlag = true;
+        boolean manifestAmbiguousExactFlag = true;
+        int businessDiscoverMinClassesFlag =
+                BusinessPrefixDiscovery.DEFAULT_DISCOVER_MIN_CLASSES;
         boolean detectProxyFlag = false;
         List<String> pinCerts = new ArrayList<>();
         String channelFlag = null;
@@ -418,7 +503,10 @@ public class PackerMain {
         boolean protectSoMaxFileExplicit = false;
         String protectSoAbi = "all";
         java.util.LinkedHashSet<String> protectSoExclude = new java.util.LinkedHashSet<>();
-        ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.EAGER;
+        ProtectOptions.SoDecryptMode soDecryptMode = ProtectOptions.SoDecryptMode.LAZY;
+        boolean startupPlainFlag = false;
+        List<String> startupPlainPrefixesFlag = new ArrayList<>();
+        Boolean startupPlainAppLeafFlag = null;
         boolean soDiag = false;
         ProtectPolicy.Profile profile = ProtectPolicy.Profile.BALANCED;
         List<String> hollowPrefixes = new ArrayList<>();
@@ -466,6 +554,32 @@ public class PackerMain {
                 dexScanCompatFlag = true;
             } else if ("--no-dex-scan-compat".equals(args[i])) {
                 dexScanCompatFlag = false;
+            } else if ("--business-parent-prefix".equals(args[i])) {
+                businessParentPrefixFlag = true;
+            } else if ("--no-business-parent-prefix".equals(args[i])) {
+                businessParentPrefixFlag = false;
+            } else if ("--business-auto-discover".equals(args[i])) {
+                businessAutoDiscoverFlag = true;
+            } else if ("--no-business-auto-discover".equals(args[i])) {
+                businessAutoDiscoverFlag = false;
+            } else if ("--business-discover-min-classes".equals(args[i]) && i + 1 < args.length) {
+                businessDiscoverMinClassesFlag = Integer.parseInt(args[++i]);
+                if (businessDiscoverMinClassesFlag < 1) {
+                    throw new IllegalArgumentException(
+                            "--business-discover-min-classes must be >= 1");
+                }
+            } else if ("--manifest-app-cross-vendor-leaf".equals(args[i])) {
+                manifestAppCrossVendorLeafFlag = true;
+            } else if ("--no-manifest-app-cross-vendor-leaf".equals(args[i])) {
+                manifestAppCrossVendorLeafFlag = false;
+            } else if ("--manifest-business-exact".equals(args[i])) {
+                manifestBusinessExactFlag = true;
+            } else if ("--no-manifest-business-exact".equals(args[i])) {
+                manifestBusinessExactFlag = false;
+            } else if ("--manifest-ambiguous-exact".equals(args[i])) {
+                manifestAmbiguousExactFlag = true;
+            } else if ("--no-manifest-ambiguous-exact".equals(args[i])) {
+                manifestAmbiguousExactFlag = false;
             } else if ("--enable-res-protect".equals(args[i]) || "--res-protect".equals(args[i])) {
                 enableResProtectFlag = true;
             } else if ("--no-res-protect".equals(args[i])) {
@@ -495,6 +609,21 @@ public class PackerMain {
                 }
             } else if ("--so-decrypt-mode".equals(args[i]) && i + 1 < args.length) {
                 soDecryptMode = ProtectOptions.parseSoDecryptMode(args[++i]);
+            } else if ("--startup-plain".equals(args[i])) {
+                startupPlainFlag = true;
+            } else if ("--no-startup-plain".equals(args[i])) {
+                startupPlainFlag = false;
+            } else if ("--startup-plain-prefix".equals(args[i]) && i + 1 < args.length) {
+                startupPlainPrefixesFlag.add(args[++i]);
+            } else if ("--startup-plain-app-leaf".equals(args[i])) {
+                startupPlainAppLeafFlag = Boolean.TRUE;
+            } else if ("--no-startup-plain-app-leaf".equals(args[i])) {
+                startupPlainAppLeafFlag = Boolean.FALSE;
+            } else if ("--dex-layout".equals(args[i]) && i + 1 < args.length) {
+                // Deprecated 0.8.0: packing always class-splits applicationId; ignore flag.
+                String ignored = args[++i];
+                System.err.println("WARN: --dex-layout '" + ignored
+                        + "' ignored (always extract applicationId classes)");
             } else if ("--so-diag".equals(args[i])) {
                 soDiag = true;
             } else if ("--application".equals(args[i]) && i + 1 < args.length) {
@@ -559,6 +688,12 @@ public class PackerMain {
         options.protectSo = protectSo;
         options.encryptAssets = encryptAssetsFlag;
         options.dexScanCompat = dexScanCompatFlag;
+        options.businessParentPrefix = businessParentPrefixFlag;
+        options.businessAutoDiscover = businessAutoDiscoverFlag;
+        options.businessDiscoverMinClasses = businessDiscoverMinClassesFlag;
+        options.manifestAppCrossVendorLeaf = manifestAppCrossVendorLeafFlag;
+        options.manifestBusinessExact = manifestBusinessExactFlag;
+        options.manifestAmbiguousExact = manifestAmbiguousExactFlag;
         options.enableResProtect = enableResProtectFlag;
         options.detectProxy = detectProxyFlag;
         options.enableNetGuard = detectProxyFlag || !pinCerts.isEmpty();
@@ -580,6 +715,9 @@ public class PackerMain {
         options.protectSoExclude.clear();
         options.protectSoExclude.addAll(protectSoExclude);
         options.soDecryptMode = soDecryptMode;
+        options.startupPlain = startupPlainFlag;
+        options.startupPlainPrefixes.addAll(startupPlainPrefixesFlag);
+        options.startupPlainAppLeaf = startupPlainAppLeafFlag;
         options.soDiag = soDiag;
         options.applicationOverride = applicationOverride;
         options.certSha256Override = certSha256Override;
@@ -707,15 +845,46 @@ public class PackerMain {
             File assetsProtector = new File(unpack, "assets/protector");
             assetsProtector.mkdirs();
 
-            // Extract & hollow / True-VMP selected methods (default: payment auto-VMP only)
-            phase("hollow", "Hollowing / VMP methods", 20);
             List<File> dexFiles = listDexFiles(unpack);
+            if (dexFiles.isEmpty()) {
+                throw new IllegalStateException("input APK has no classes*.dex");
+            }
+            File manifestFile = new File(unpack, "AndroidManifest.xml");
+            DexLayout.Context layoutCtx = buildDexLayoutContext(
+                    packageName, manifestFile, dexFiles);
+            File dexZip = new File(assetsProtector, "dexes.zip");
+
+            // Always class-split: isBusinessType → dexes.zip; non-business → APK root (AOT).
+            phase("dex_split", "Splitting business classes", 15);
+            File splitWork = new File(work.toFile(), "class-split");
+            DexClassSplit.Bundle split = DexClassSplit.splitAll(dexFiles, layoutCtx, splitWork);
+            for (File dex : dexFiles) {
+                //noinspection ResultOfMethodCallIgnored
+                dex.delete();
+            }
+            List<File> toHollow = new ArrayList<>(split.businessDexes);
+            List<File> plainKept = new ArrayList<>(split.plainDexes);
+            if (!split.unprotectedPlainSources.isEmpty()) {
+                System.out.println("WARN: unprotected plain DEX (business may remain in APK root): "
+                        + split.unprotectedPlainSources
+                        + " — not advertised as extracted/thinned");
+            }
+            if (split.totalBusinessClasses == 0) {
+                System.out.println("WARN: class-split extracted 0 business classes for prefix="
+                        + layoutCtx.appPackagePrefix
+                        + " extras=" + layoutCtx.businessPrefixes
+                        + " — Manifest package / discovery may not match code namespaces; "
+                        + "add --hollow-prefix for real app packages (e.g. sibling modules)");
+            }
+
+            // Hollow / True-VMP only extracted app-package DEX.
+            phase("hollow", "Hollowing / VMP methods", 20);
             Map<Integer, List<InsnRecord>> all = new HashMap<>();
             int autoVmpTypes = 0;
             int autoVmpMethods = 0;
             int autoIndustryTypes = 0;
             int autoIndustryMethods = 0;
-            for (File dex : dexFiles) {
+            for (File dex : toHollow) {
                 int dexNo = dexNumber(dex.getName());
                 File hollowed = new File(dex.getParent(), dex.getName() + ".hollow");
                 HollowResult hr = hollowDex(dex, hollowed, aesKey, dexNo);
@@ -726,6 +895,9 @@ public class PackerMain {
                 autoIndustryMethods += hr.autoIndustryMethods;
                 Files.move(hollowed.toPath(), dex.toPath(), StandardCopyOption.REPLACE_EXISTING);
                 System.out.println("Hollowed " + dex.getName() + " methods=" + hr.records.size());
+            }
+            if (toHollow.isEmpty()) {
+                System.out.println("Hollow skipped (no DEX to encrypt)");
             }
             System.out.println("Auto True-VMP (alipay|/wxapi/): types=" + autoVmpTypes
                     + " methods=" + autoVmpMethods);
@@ -741,19 +913,19 @@ public class PackerMain {
             File codeBin = new File(assetsProtector, "code.bin");
             writeCodeBin(codeBin, all);
 
-            // All business DEX go into encrypted dexes.zip — APK must not contain plaintext
-            // business classesN.dex (shell + junk only after embed).
-            File dexZip = new File(assetsProtector, "dexes.zip");
-            if (dexFiles.isEmpty()) {
-                throw new IllegalStateException("input APK has no classes*.dex");
+            // Pack encrypted set into PDX1 dexes.zip; plainKept staged for after shell.
+            if (toHollow.isEmpty()) {
+                writeEmptyZip(dexZip);
+                System.out.println("dexes.zip entries=0 (no applicationId classes extracted)");
+            } else {
+                zipDeflate(toHollow, dexZip);
+                for (File dex : toHollow) {
+                    //noinspection ResultOfMethodCallIgnored
+                    dex.delete();
+                }
+                System.out.println("dexes.zip entries=" + toHollow.size()
+                        + " (class-split); plain_kept=" + plainKept.size());
             }
-            zipDeflate(dexFiles, dexZip);
-            for (File dex : dexFiles) {
-                //noinspection ResultOfMethodCallIgnored
-                dex.delete();
-            }
-            System.out.println("dexes.zip entries=" + dexFiles.size()
-                    + " (all business DEX; no plaintext multidex in base.apk)");
             encryptDexesZipPdx1(dexZip, dexAesKey);
             String dexHmacHex = CryptoUtils.toHex(
                     CryptoUtils.hmacSha256(hmacKey, Files.readAllBytes(dexZip.toPath())));
@@ -809,6 +981,8 @@ public class PackerMain {
             Map<String, String> bitcodeHmac = embedShell(unpack, shellHint, kWrap, kMaster, hmacKey);
             Arrays.fill(kMaster, (byte) 0);
             Arrays.fill(kWrap, (byte) 0);
+            // Re-attach non-business (or KEEP_FULL) plain DEX as classes2…N after shell.
+            placePlainDexesAfterShell(unpack, plainKept);
 
             // config.json — AES/HMAC keys are HKDF-derived at runtime, not stored here.
             // HMAC-SHA256 protects risk_flags / rasp_action / app_sign_sha256 / protect_so /
@@ -1132,10 +1306,90 @@ public class PackerMain {
     private void embedJunkCodeDex(File unpack, File workDir) throws Exception {
         File junkDex = new File(workDir, "junkcode.dex");
         JunkCodeGenerator.generateJunkCodeDex(junkDex);
-        // After shell is classes.dex, junk is classes2.dex (business DEX are only in dexes.zip).
+        // After shell (+ optional hybrid plain DEX), next free classesN.dex.
         File target = nextFreeClassesDex(unpack, null);
         Files.copy(junkDex.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
         System.out.println("Embedded junk dex as " + target.getName());
+    }
+
+    private DexLayout.Context buildDexLayoutContext(
+            String applicationId, File manifest, List<File> dexFiles) {
+        DexLayout.Context ctx = new DexLayout.Context();
+        ctx.mode = DexLayout.Mode.HYBRID;
+        ctx.appPackagePrefix = ProtectPolicy.toDescriptorPrefix(applicationId);
+        if (protectPolicy != null && protectPolicy.appPackagePrefix() != null) {
+            ctx.appPackagePrefix = protectPolicy.appPackagePrefix();
+        }
+        ctx.hollowPrefixes.addAll(hollowPrefixes);
+        ctx.trueVmpPrefixes.addAll(trueVmpPrefixes);
+        ctx.paymentAutoVmp = paymentAutoVmpEffective;
+        ctx.industryAutoVmp = industryAutoVmpEffective;
+
+        boolean perfNarrow = protectPolicy != null
+                && protectPolicy.profile() == ProtectPolicy.Profile.PERF;
+        BusinessPrefixDiscovery.Options disc = new BusinessPrefixDiscovery.Options();
+        // PERF: skip parent/cluster discovery — narrow encrypt uses exact + VMP only.
+        disc.parentPrefix = perfNarrow ? false : businessParentPrefix;
+        disc.autoDiscover = perfNarrow ? false : businessAutoDiscover;
+        disc.discoverMinClasses = businessDiscoverMinClasses;
+        disc.appCrossVendorLeaf = manifestAppCrossVendorLeaf;
+        disc.businessExact = manifestBusinessExact;
+        disc.ambiguousExact = manifestAmbiguousExact;
+        if (perfNarrow) {
+            ctx.matchAppPackagePrefix = false;
+            ctx.matchBusinessPrefixes = false;
+            System.out.println("PERF class-split: narrow encrypt "
+                    + "(exact + hollow-prefix + True-VMP; no app/cluster prefix)");
+        }
+        System.out.println("Business prefix discovery: "
+                + BusinessPrefixDiscovery.describeOptions(disc));
+        BusinessPrefixDiscovery.enrich(ctx, manifest, applicationId, dexFiles, disc);
+        if (startupPlain) {
+            StartupPlain.apply(ctx, manifest, applicationId);
+        } else {
+            System.out.println("Startup-plain: auto Application/LAUNCHER off");
+        }
+        // Default OFF for all profiles (Application encrypted). Opt in with
+        // --startup-plain-app-leaf (previously auto-ON under PERF).
+        boolean appLeaf = startupPlainAppLeaf != null
+                && startupPlainAppLeaf.booleanValue();
+        if (appLeaf) {
+            StartupPlain.applyAppLeaf(ctx, manifest, applicationId);
+        }
+        if (!startupPlainPrefixes.isEmpty()) {
+            StartupPlain.applyPrefixes(ctx, startupPlainPrefixes);
+        }
+        return ctx;
+    }
+
+    /**
+     * After shell {@code classes.dex} is embedded, place class-split plain DEX as
+     * contiguous {@code classes2.dex}, {@code classes3.dex}, …
+     * (non-business stripped when safe; may be KEEP_FULL_UNPROTECTED originals).
+     */
+    private static void placePlainDexesAfterShell(File unpack, List<File> stagedPlain)
+            throws Exception {
+        if (stagedPlain == null || stagedPlain.isEmpty()) {
+            return;
+        }
+        // Drop any leftover classes*.dex other than shell (should already be gone).
+        File[] leftovers = unpack.listFiles((d, n) ->
+                n.startsWith("classes") && n.endsWith(".dex") && !"classes.dex".equals(n));
+        if (leftovers != null) {
+            for (File f : leftovers) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
+        }
+        stagedPlain.sort(Comparator.comparingInt(f -> dexNumber(f.getName())));
+        int n = 2;
+        for (File staged : stagedPlain) {
+            File target = new File(unpack, "classes" + n + ".dex");
+            Files.move(staged.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            System.out.println("Hybrid plain DEX → " + target.getName()
+                    + " (from " + staged.getName() + ")");
+            n++;
+        }
     }
 
     /**
@@ -1966,6 +2220,14 @@ public class PackerMain {
             for (File dex : dexFiles) {
                 zf.addFile(dex, params);
             }
+        }
+    }
+
+    /** Minimal valid empty ZIP (EOCD only) for hybrid with zero encrypted DEX. */
+    private static void writeEmptyZip(File outZip) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(outZip);
+             ZipOutputStream zos = new ZipOutputStream(fos)) {
+            zos.finish();
         }
     }
 
